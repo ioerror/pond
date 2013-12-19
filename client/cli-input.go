@@ -22,6 +22,7 @@ type cliCommand struct {
 }
 
 var cliCommands = []cliCommand{
+	{"abort", abortCommand{}, "Abort a pending item in the queue, and place it back into drafts"},
 	{"acknowledge", ackCommand{}, "Acknowledge the inbox message"},
 	{"attach", attachCommand{}, "Attach a file to the current draft"},
 	{"compose", composeCommand{}, "Compose a new message"},
