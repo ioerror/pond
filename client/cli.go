@@ -924,7 +924,6 @@ Handle:
 		default:
 		}
 
-
 	case ackCommand:
 		msg, ok := c.currentObj.(*InboxMessage)
 		if !ok {
@@ -1326,7 +1325,7 @@ func (c *cliClient) renameContact(oldName string, newName string) bool {
 		}
 	}
 
-        for _, contact := range c.contacts {
+	for _, contact := range c.contacts {
 		if contact.name == oldName {
 			contact.name = newName
 			c.save()
@@ -1340,8 +1339,8 @@ func (c *cliClient) rmContact(name string) bool {
 	for _, contact := range c.contacts {
 		if contact.name == name {
 			delete(c.contacts, contact.id)
-				c.save()
-				return true
+			c.save()
+			return true
 		}
 	}
 	return false
