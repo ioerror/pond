@@ -17,7 +17,26 @@ before_install:
   - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial pkg-config libgtkspell-3-0 libgtkspell0
 script:
   - go build -tags nogui github.com/agl/pond/client
+  # This currently fails:
   - go build -tags ubuntu github.com/agl/pond/client
+  # - go test -tags nogui github.com/agl/pond/client
   - go build -tags ubuntu github.com/agl/pond/server
+  # This currently fails:
+  #- go test -tags ubuntu github.com/agl/pond/server
   - go build -tags ubuntu github.com/agl/pond/editstate
+  - go test -tags ubuntu github.com/agl/pond/editstate
   - go build -tags ubuntu github.com/agl/pond/decrypt
+  # This isn't currently building as it lacks tests:
+  # - go test -tags ubuntu github.com/agl/pond/decrypt
+  - go build github.com/agl/pond/panda
+  - go test github.com/agl/pond/panda
+  - go build github.com/agl/pond/bbssig
+  - go test github.com/agl/pond/bbssig
+  # This currently fails:
+  # - go build github.com/agl/pond/bn256cgo
+  # - go test github.com/agl/pond/bn256cgo
+  - go build github.com/agl/pond/pathrewrite
+  # This isn't currently building as it lacks tests:
+  # - go test github.com/agl/pond/pathrewrite
+  # This requires some work to run a server and then we may also run the transport tests:
+  # go test github.com/agl/pond/transport
