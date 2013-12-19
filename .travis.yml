@@ -6,7 +6,9 @@ go:
 branches:
   only:
     - master
+install:
+  - go get github.com/agl/pond/client
 before_install:
   - sudo apt-get update -qq
-  - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial
-script: go test
+  - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial pkg-config
+script: cd client/ && go test
