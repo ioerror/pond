@@ -46,6 +46,7 @@ var cliCommands = []cliCommand{
 	{"queue", showQueueStateCommand{}, "Show the queue"},
 	{"status", statusCommand{}, "Show overall Pond status"},
 	{"upload", uploadCommand{}, "Upload a file to home server and include key in current draft"},
+	{"close", closeCommand{}, "Close currently opened object"},
 }
 
 type abortCommand struct{}
@@ -65,6 +66,7 @@ type showInboxSummaryCommand struct{}
 type showDraftsSummaryCommand struct{}
 type showQueueStateCommand struct{}
 type statusCommand struct{}
+type closeCommand struct{}
 
 type newContactCommand struct {
 	Name string
@@ -364,6 +366,8 @@ func (i *cliInput) processInput(commandsChan chan<- cliTerminalLine) {
 func (input *cliInput) showHelp() {
 	examples := make([]string, len(cliCommands))
 	maxLen := 0
+
+	fmt.Fprintf(input.term, "%s (To open a new object enter the identifier contained between brackets)\n\n", termInfoPrefix)
 
 	for i, cmd := range cliCommands {
 		line := cmd.name
