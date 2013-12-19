@@ -29,5 +29,3 @@ it'll be transmitted again in two cycles."
 Document the easy way to build the CLI:
 
 go build -tags nogui && go install -tags nogui
-
-Travis-CI integration
