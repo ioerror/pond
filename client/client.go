@@ -929,6 +929,30 @@ func (c *client) newKeyExchange(contact *Contact) {
 	}
 }
 
+func (c *cliClient) abortSendMessage(msg *queuedMessage) {
+	var index int
+	var draft *Draft
+
+	c.queueMutex.Lock()
+	index = c.indexOfQueuedMessage(msg)
+	if index == -1 || msg.sending {
+		c.queueMutex.Unlock()
+		c.Printf("Too Late to Abort!\n")
+		return
+	}
+	c.removeQueuedMessage(index)
+	c.queueMutex.Unlock()
+
+	draft = c.outboxToDraft(msg)
+	c.deleteOutboxMsg(msg.id)
+	c.drafts[draft.id] = draft
+
+	c.Printf("%s Aborted %s%s%s and moved to Drafts\n", termInfoPrefix, termCliIdStart, msg.cliId.String(), termReset)
+	c.save()
+	c.setCurrentObject(draft)
+	return
+}
+
 func (c *client) deleteInboxMsg(id uint64) {
 	newInbox := make([]*InboxMessage, 0, len(c.inbox))
 	for _, inboxMsg := range c.inbox {

@@ -827,11 +827,25 @@ Handle:
 		switch o := c.currentObj.(type) {
 		case *Draft:
 			delete(c.drafts, o.id)
-			c.save()
-			c.setCurrentObject(nil)
+		case *InboxMessage:
+			c.deleteInboxMsg(o.id)
+		case *queuedMessage:
+			/* Should we abort pending sends?
+			c.queueMutex.Lock()
+			index = c.indexOfQueuedMessage(o)
+			if index == -1 || o.sending {
+				c.queueMutex.Unlock()
+			} else {
+				c.removeQueuedMessage(index)
+				c.queueMutex.Unlock()
+			}*/
+			c.deleteOutboxMsg(o.id)
 		default:
 			c.Printf("%s Cannot delete current object\n", termWarnPrefix)
+			return
 		}
+		c.save()
+		c.setCurrentObject(nil)
 
 	case sendCommand:
 		draft, ok := c.currentObj.(*Draft)
@@ -901,26 +915,7 @@ Handle:
 		}
 		switch o := c.currentObj.(type) {
 		case *queuedMessage:
-			var index int
-			var draft *Draft
-
-			c.queueMutex.Lock()
-			index = c.indexOfQueuedMessage(o)
-			if index == -1 || o.sending {
-				c.queueMutex.Unlock()
-				c.Printf("Too Late to Abort!\n")
-				return
-			}
-			c.removeQueuedMessage(index)
-			c.queueMutex.Unlock()
-
-			draft = c.outboxToDraft(o)
-			c.deleteOutboxMsg(o.id)
-			c.drafts[draft.id] = draft
-
-			c.Printf("%s Aborted %s%s%s and moved to Drafts\n", termInfoPrefix, termCliIdStart, o.cliId.String(), termReset)
-			c.save()
-			c.setCurrentObject(draft)
+			c.abortSendMessage(o)
 		default:
 		}
 
