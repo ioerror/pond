@@ -813,6 +813,11 @@ Handle:
 			c.Printf("%s (%s) %s\n", termHeaderPrefix, entry.Format(logTimeFormat), terminalEscape(entry.s, false))
 		}
 
+	case closeCommand:
+		if c.currentObj != nil {
+			c.setCurrentObject(nil)
+		}
+
 	case quitCommand:
 		c.ShutdownAndSuspend()
 		c.Printf("Goodbye!\n")
