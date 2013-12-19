@@ -367,8 +367,6 @@ func (input *cliInput) showHelp() {
 	examples := make([]string, len(cliCommands))
 	maxLen := 0
 
-	fmt.Fprintf(input.term, "%s (To open a new object enter the identifier contained between brackets)\n\n", termInfoPrefix)
-
 	for i, cmd := range cliCommands {
 		line := "/" + cmd.name
 		prototype := reflect.TypeOf(cmd.prototype)
