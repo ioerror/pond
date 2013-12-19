@@ -366,7 +366,7 @@ func (input *cliInput) showHelp() {
 	maxLen := 0
 
 	for i, cmd := range cliCommands {
-		line := "/" + cmd.name
+		line := cmd.name
 		prototype := reflect.TypeOf(cmd.prototype)
 		for j := 0; j < prototype.NumField(); j++ {
 			if strings.HasPrefix(string(prototype.Field(j).Tag), "flag:") {
