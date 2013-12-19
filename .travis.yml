@@ -13,4 +13,4 @@ install:
 before_install:
   - sudo apt-get update -qq
   - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial pkg-config
-script: go test
+#script: go test
