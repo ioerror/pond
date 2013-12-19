@@ -14,7 +14,7 @@ install:
   - go get -tags ubuntu github.com/agl/pond/client
 before_install:
   - sudo apt-get update -qq
-  - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial pkg-config libgtkspell
+  - sudo apt-get install -qq golang git libgtk-3-dev libgtkspell-3-dev libtspi-dev trousers tor mercurial pkg-config libgtkspell-3-0
 script:
   - go build -tags nogui github.com/agl/pond/client
   - go build -tags ubuntu github.com/agl/pond/client
