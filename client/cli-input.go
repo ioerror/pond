@@ -379,8 +379,6 @@ func (input *cliInput) showHelp(context string) {
 			} else {
 				line += " <" + strings.ToLower(prototype.Field(j).Name) + ">"
 			}
-
-			line += cmd.context
 		}
 		if l := len(line); l > maxLen {
 			maxLen = l
