@@ -38,6 +38,7 @@ var cliCommands = []cliCommand{
 	{"new-contact", newContactCommand{}, "Start a key exchange with a new contact", ""},
 	{"rm-contact", rmContactCommand{}, "Remove an existing contact", ""},
 	{"mv-contact", mvContactCommand{}, "Rename an existing contact", ""},
+	{"fetch-now", fetchNowCommand{}, "Perform a network transaction now", ""},
 
 	// Contact commands.
 	{"compose", composeCommand{}, "Compose a new message", "contact"},
@@ -79,6 +80,7 @@ type showDraftsSummaryCommand struct{}
 type showQueueStateCommand struct{}
 type statusCommand struct{}
 type closeCommand struct{}
+type fetchNowCommand struct{}
 
 type newContactCommand struct {
 	Name string
