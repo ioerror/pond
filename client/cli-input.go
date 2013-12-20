@@ -27,6 +27,7 @@ var cliCommands = []cliCommand{
 	{"status", statusCommand{}, "Show overall Pond status", ""},
 	{"log", logCommand{}, "Show recent log entries", ""},
 	{"close", closeCommand{}, "Close currently opened object", ""},
+	{"clear", clearCommand{}, "Clear the console", ""},
 	{"quit", quitCommand{}, "Exit Pond", ""},
 	{"show", showCommand{}, "Show the current object", ""},
 	{"outbox", showOutboxSummaryCommand{}, "Show the Outbox", ""},
@@ -79,6 +80,7 @@ type showDraftsSummaryCommand struct{}
 type showQueueStateCommand struct{}
 type statusCommand struct{}
 type closeCommand struct{}
+type clearCommand struct{}
 
 type newContactCommand struct {
 	Name string
