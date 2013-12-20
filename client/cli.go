@@ -770,7 +770,6 @@ Handle:
 	switch cmd := cmd.(type) {
 	case helpCommand:
 		var showAll bool
-		showAll = false
 		if cmd.All {
 			showAll = true
 		} else {
