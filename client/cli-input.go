@@ -24,30 +24,38 @@ type cliCommand struct {
 
 var cliCommands = []cliCommand{
 	{"help", helpCommand{}, "List known commands", ""},
+	{"status", statusCommand{}, "Show overall Pond status", ""},
 	{"log", logCommand{}, "Show recent log entries", ""},
 	{"close", closeCommand{}, "Close currently opened object", ""},
 	{"quit", quitCommand{}, "Exit Pond", ""},
-	{"abort", abortCommand{}, "Abort a pending item in the queue, and place it back into drafts", "queue"},
-	{"acknowledge", ackCommand{}, "Acknowledge the inbox message", "inbox"},
-	{"attach", attachCommand{}, "Attach a file to the current draft", "draft"},
-	{"compose", composeCommand{}, "Compose a new message", "contact"},
-	{"contacts", contactsCommand{}, "Show all known contacts", ""},
-	{"delete", deleteCommand{}, "Delete a message", ""},
-	{"download", downloadCommand{}, "Download a numbered detachment to disk", ""},
-	{"edit", editCommand{}, "Edit the draft message", "draft"},
-	{"new-contact", newContactCommand{}, "Start a key exchange with a new contact", ""},
-	{"rm-contact", rmContactCommand{}, "Remove an existing contact", ""},
-	{"mv-contact", mvContactCommand{}, "Rename an existing contact", ""},
-	{"remove", removeCommand{}, "Remove an attachment or detachment from a draft message", "draft"},
-	{"reply", replyCommand{}, "Reply to the current message", "inbox"},
-	{"save", saveCommand{}, "Save a numbered attachment to disk", ""},
-	{"send", sendCommand{}, "Send the current draft", "draft"},
 	{"show", showCommand{}, "Show the current object", ""},
 	{"outbox", showOutboxSummaryCommand{}, "Show the Outbox", ""},
 	{"inbox", showInboxSummaryCommand{}, "Show the Inbox", ""},
 	{"drafts", showDraftsSummaryCommand{}, "Show the Draftbox", ""},
 	{"queue", showQueueStateCommand{}, "Show the queue", ""},
-	{"status", statusCommand{}, "Show overall Pond status", ""},
+	{"contacts", contactsCommand{}, "Show all known contacts", ""},
+	{"delete", deleteCommand{}, "Delete a message", ""},
+	{"new-contact", newContactCommand{}, "Start a key exchange with a new contact", ""},
+	{"rm-contact", rmContactCommand{}, "Remove an existing contact", ""},
+	{"mv-contact", mvContactCommand{}, "Rename an existing contact", ""},
+
+	// Contact commands.
+	{"compose", composeCommand{}, "Compose a new message", "contact"},
+
+	// Inbox commands.
+	{"reply", replyCommand{}, "Reply to the current message", "inbox"},
+	{"acknowledge", ackCommand{}, "Acknowledge the inbox message", "inbox"},
+	{"download", downloadCommand{}, "Download a numbered detachment to disk", "inbox"},
+	{"save", saveCommand{}, "Save a numbered attachment to disk", "inbox"},
+
+	// Queue commands.
+	{"abort", abortCommand{}, "Abort a pending item in the queue, and place it back into drafts", "queue"},
+
+	// Draft commands.
+	{"edit", editCommand{}, "Edit the draft message", "draft"},
+	{"send", sendCommand{}, "Send the current draft", "draft"},
+	{"attach", attachCommand{}, "Attach a file to the current draft", "draft"},
+	{"remove", removeCommand{}, "Remove an attachment or detachment from a draft message", "draft"},
 	{"upload", uploadCommand{}, "Upload a file to home server and include key in current draft", "draft"},
 }
 
@@ -57,7 +65,9 @@ type composeCommand struct{}
 type contactsCommand struct{}
 type deleteCommand struct{}
 type editCommand struct{}
-type helpCommand struct{}
+type helpCommand struct{
+	All bool `flag:all`
+}
 type logCommand struct{}
 type quitCommand struct{}
 type replyCommand struct{}
@@ -361,7 +371,7 @@ func (i *cliInput) processInput(commandsChan chan<- cliTerminalLine) {
 	}
 }
 
-func (input *cliInput) showHelp(context string) {
+func (input *cliInput) showHelp(context string, showAll bool) {
 	examples := make([]string, len(cliCommands))
 	maxLen := 0
 
@@ -382,10 +392,12 @@ func (input *cliInput) showHelp(context string) {
 	}
 
 	for i, cmd := range cliCommands {
-		// Check if the provided context is the same as the one specified at
-		// the definition of the CLI command. Also accept generic commands.
-		if (cmd.context != "" && cmd.context != context) {
-			continue
+		if showAll == false {
+			// Check if the provided context is the same as the one specified at
+			// the definition of the CLI command. Also accept generic commands.
+			if (cmd.context != "" && cmd.context != context) {
+				continue
+			}
 		}
 
 		line := examples[i]

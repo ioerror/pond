@@ -769,20 +769,28 @@ Handle:
 
 	switch cmd := cmd.(type) {
 	case helpCommand:
+		var showAll bool
+		showAll = false
+		if cmd.All {
+			showAll = true
+		} else {
+			showAll = false
+		}
+
 		if c.currentObj == nil {
-			c.input.showHelp("")	
+			c.input.showHelp("", showAll)	
 		} else {
 			switch c.currentObj.(type) {
 			case *Contact:
-				c.input.showHelp("contact")
+				c.input.showHelp("contact", showAll)
 			case *Draft:
-				c.input.showHelp("draft")
+				c.input.showHelp("draft", showAll)
 			case *InboxMessage:
-				c.input.showHelp("inbox")
+				c.input.showHelp("inbox", showAll)
 			case *queuedMessage:
-				c.input.showHelp("queue")
+				c.input.showHelp("queue", showAll)
 			default:
-				c.input.showHelp("")
+				c.input.showHelp("", showAll)
 			}
 		}
 		
