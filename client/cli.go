@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -768,6 +769,19 @@ Handle:
 	c.termWrapper.Restart()
 
 	switch cmd := cmd.(type) {
+	case clearCommand:
+		switch runtime.GOOS {
+		case "windows":
+			cls := exec.Command("cmd", "/c", "cls")
+			cls.Stdout = os.Stdout
+			cls.Run()
+		
+		default:
+			cls := exec.Command("clear")
+			cls.Stdout = os.Stdout
+			cls.Run()
+		}
+
 	case helpCommand:
 		var showAll bool
 		if cmd.All {
