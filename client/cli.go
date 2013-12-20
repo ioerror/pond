@@ -797,7 +797,6 @@ Handle:
 
 	case tagCommand:
 		if len(cmd.tag) == 0 {
-			c.showState()
 			return
 		}
 		cliId, ok := cliIdFromString(cmd.tag)
