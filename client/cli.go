@@ -970,6 +970,22 @@ Handle:
 		default:
 		}
 
+	case abortAllCommand:
+		if !cmd.Confirm {
+			c.Printf("%s Please confirm with --confirm flag!\n", termWarnPrefix)
+			return
+		}
+
+		if len(c.queue) > 0 {
+			c.Printf("%s Going to abort %d message/s in the queue!\n", termInfoPrefix, len(c.queue))
+
+			for _, msg := range c.queue {
+				c.abortSendMessage(msg)
+			}
+		} else {
+			c.Printf("%s There are no messages in the queue\n", termInfoPrefix)
+		}
+
 	case ackCommand:
 		msg, ok := c.currentObj.(*InboxMessage)
 		if !ok {
