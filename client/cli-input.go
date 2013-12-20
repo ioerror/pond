@@ -40,6 +40,7 @@ var cliCommands = []cliCommand{
 	{"rm-contact", rmContactCommand{}, "Remove an existing contact", ""},
 	{"mv-contact", mvContactCommand{}, "Rename an existing contact", ""},
 	{"transact-now", transactNowCommand{}, "Perform a network transaction now", ""},
+	{"abort-all", abortAllCommand{}, "Emergency abort of all messages in the queue", ""},
 
 	// Contact commands.
 	{"compose", composeCommand{}, "Compose a new message", "contact"},
@@ -121,6 +122,10 @@ type removeCommand struct {
 
 type tagCommand struct {
 	tag string
+}
+
+type abortAllCommand struct {
+	Confirm bool `flag:confirm`
 }
 
 func numPositionalFields(t reflect.Type) int {
