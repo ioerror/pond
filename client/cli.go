@@ -768,6 +768,33 @@ Handle:
 	c.termWrapper.Restart()
 
 	switch cmd := cmd.(type) {
+	case helpCommand:
+		var showAll bool
+		if cmd.All {
+			showAll = true
+		} else {
+			showAll = false
+		}
+
+		if c.currentObj == nil {
+			c.input.showHelp("", showAll)	
+		} else {
+			switch c.currentObj.(type) {
+			case *Contact:
+				c.input.showHelp("contact", showAll)
+			case *Draft:
+				c.input.showHelp("draft", showAll)
+			case *InboxMessage:
+				c.input.showHelp("inbox", showAll)
+			case *queuedMessage:
+				c.input.showHelp("queue", showAll)
+			default:
+				c.input.showHelp("", showAll)
+			}
+		}
+		
+		return
+
 	case tagCommand:
 		if len(cmd.tag) == 0 {
 			c.showState()
