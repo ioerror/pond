@@ -858,6 +858,12 @@ Handle:
 			c.setCurrentObject(nil)
 		}
 
+	case transactNowCommand:
+		select {
+		case c.fetchNowChan <- nil:
+		default:
+		}
+
 	case quitCommand:
 		c.ShutdownAndSuspend()
 		c.Printf("Goodbye!\n")
