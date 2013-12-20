@@ -353,12 +353,7 @@ func (i *cliInput) processInput(commandsChan chan<- cliTerminalLine) {
 			ackChan = nil
 			continue
 		}
-		// Disabled to enable context-aware help messages.
-		/*if _, ok := cmd.(helpCommand); ok {
-			i.showHelp()
-			ackChan = nil
-			continue
-		}*/
+
 		if cmd != nil {
 			commandsChan <- cliTerminalLine{command: cmd, ackChan: ackChan}
 		}
