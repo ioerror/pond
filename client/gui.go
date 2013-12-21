@@ -3273,6 +3273,7 @@ func (c *guiClient) logUI() interface{} {
 	c.gui.Actions() <- SetChild{name: "right", child: ui}
 	c.gui.Actions() <- SetTextView{name: "log", text: log}
 	c.gui.Actions() <- UIState{uiStateLog}
+	c.gui.Actions() <- ScrollTextViewToEnd{name: "log"}
 	c.gui.Signal()
 
 	for {
@@ -3302,6 +3303,7 @@ func (c *guiClient) logUI() interface{} {
 		c.log.Unlock()
 
 		c.gui.Actions() <- SetTextView{name: "log", text: log}
+		c.gui.Actions() <- ScrollTextViewToEnd{name: "log"}
 		c.gui.Signal()
 	}
 
