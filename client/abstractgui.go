@@ -312,6 +312,10 @@ type SetTextView struct {
 	text string
 }
 
+type ScrollTextViewToEnd struct {
+	name string
+}
+
 type SetImage struct {
 	name  string
 	image Indicator
