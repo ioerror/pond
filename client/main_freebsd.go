@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
-	"github.com/agl/pond/client/system"
 )
 
 func main() {
@@ -16,8 +14,6 @@ func main() {
 	stateFile := flag.String("state-file", "", "File in which to save persistent state")
 	cliFlag := flag.Bool("cli", false, "If true, the CLI will be used, even if the GUI is available")
 	flag.Parse()
-
-	runtime.LockOSThread()
 
 	dev := os.Getenv("POND") == "dev" || *devFlag
 	runtime.GOMAXPROCS(4)
@@ -35,19 +31,12 @@ func main() {
 		*stateFile = filepath.Join(home, ".pond")
 	}
 
-	defer system.Shutdown()
-
 	if !haveGUI || *cliFlag {
 		client := NewCLIClient(*stateFile, rand.Reader, false /* testing */, true /* autoFetch */)
 		client.disableV2Ratchet = true
 		client.dev = dev
 		client.Start()
 	} else {
-		ui := NewGTKUI()
-		client := NewGUIClient(*stateFile, ui, rand.Reader, false /* testing */, true /* autoFetch */)
-		client.disableV2Ratchet = true
-		client.dev = dev
-		client.Start()
-		ui.Run()
+		fmt.Fprintf(os.Stderr, "GUI not supported on %s\n", runtime.GOOS)
 	}
 }

@@ -63,7 +63,6 @@ func (c *client) sendAck(msg *InboxMessage) {
 	c.queueMutex.Unlock()
 
 	to := c.contacts[msg.from]
-
 	var myNextDH []byte
 	if to.ratchet == nil {
 		var nextDHPub [32]byte
@@ -108,6 +107,40 @@ func (c *client) send(to *Contact, message *pond.Message) error {
 	c.outbox = append(c.outbox, out)
 
 	return nil
+}
+
+func (c *client) sendDraft(draft *Draft) (uint64, time.Time, error) {
+	to := c.contacts[draft.to]
+
+	// Zero length bodies are ACKs.
+	if len(draft.body) == 0 {
+		draft.body = " "
+	}
+
+	id := c.randId()
+	created := c.Now()
+	message := &pond.Message{
+		Id:               proto.Uint64(id),
+		Time:             proto.Int64(created.Unix()),
+		Body:             []byte(draft.body),
+		BodyEncoding:     pond.Message_RAW.Enum(),
+		Files:            draft.attachments,
+		DetachedFiles:    draft.detachments,
+		SupportedVersion: proto.Int32(protoVersion),
+	}
+
+	if r := draft.inReplyTo; r != 0 {
+		message.InReplyTo = proto.Uint64(r)
+	}
+
+	if to.ratchet == nil {
+		var nextDHPub [32]byte
+		curve25519.ScalarBaseMult(&nextDHPub, &to.currentDHPrivate)
+		message.MyNextDh = nextDHPub[:]
+	}
+
+	err := c.send(to, message)
+	return id, created, err
 }
 
 // tooLarge returns true if the given message is too large to serialise.
@@ -191,10 +224,10 @@ func (c *client) processSigningRequest(sigReq signingRequest) {
 
 	request := &pond.Request{
 		Deliver: &pond.Delivery{
-			To:         to.theirIdentityPublic[:],
-			Signature:  groupSig,
-			Generation: proto.Uint32(to.generation),
-			Message:    sealed,
+			To:             to.theirIdentityPublic[:],
+			GroupSignature: groupSig,
+			Generation:     proto.Uint32(to.generation),
+			Message:        sealed,
 		},
 	}
 
@@ -362,14 +395,14 @@ func (c *client) processFetch(m NewMessage) {
 
 	var tag []byte
 	var ok bool
-	if c.groupPriv.Verify(digest, sha, f.Signature) {
-		tag, ok = c.groupPriv.Open(f.Signature)
+	if c.groupPriv.Verify(digest, sha, f.GroupSignature) {
+		tag, ok = c.groupPriv.Open(f.GroupSignature)
 	} else {
 		found := false
 		for _, prev := range c.prevGroupPrivs {
-			if prev.priv.Verify(digest, sha, f.Signature) {
+			if prev.priv.Verify(digest, sha, f.GroupSignature) {
 				found = true
-				tag, ok = c.groupPriv.Open(f.Signature)
+				tag, ok = c.groupPriv.Open(f.GroupSignature)
 				break
 			}
 		}
@@ -379,7 +412,7 @@ func (c *client) processFetch(m NewMessage) {
 		}
 	}
 	if !ok {
-		c.log.Errorf("Failed to open group signature")
+		c.log.Errorf("Failed to open group signature!")
 		return
 	}
 
@@ -411,7 +444,7 @@ NextCandidate:
 	}
 
 	if len(f.Message) < box.Overhead+24 {
-		c.log.Errorf("Message too small to process from %s", from.name)
+		c.logEvent(from, "Message too small to process")
 		return
 	}
 
@@ -422,8 +455,10 @@ NextCandidate:
 		sealed:       f.Message,
 	}
 
-	if !from.isPending && !c.unsealMessage(inboxMsg, from) {
-		return
+	if !from.isPending {
+		if !c.unsealMessage(inboxMsg, from) || len(inboxMsg.message.Body) == 0 {
+			return
+		}
 	}
 
 	c.inbox = append(c.inbox, inboxMsg)
@@ -454,26 +489,26 @@ func (c *client) unsealMessage(inboxMsg *InboxMessage, from *Contact) bool {
 	plaintext, ok := decryptMessage(sealed, from)
 
 	if !ok {
-		c.log.Errorf("Failed to decrypt message from %s", from.name)
+		c.logEvent(from, "Failed to decrypt message")
 		return false
 	}
 
 	if len(plaintext) < 4 {
-		c.log.Errorf("Plaintext too small to process from %s", from.name)
+		c.logEvent(from, "Plaintext too small to process")
 		return false
 	}
 
 	mLen := int(binary.LittleEndian.Uint32(plaintext[:4]))
 	plaintext = plaintext[4:]
 	if mLen < 0 || mLen > len(plaintext) {
-		c.log.Errorf("Plaintext length incorrect from %s: %d", from.name, mLen)
+		c.logEvent(from, fmt.Sprintf("Plaintext length incorrect: %d", mLen))
 		return false
 	}
 	plaintext = plaintext[:mLen]
 
 	msg := new(pond.Message)
 	if err := proto.Unmarshal(plaintext, msg); err != nil {
-		c.log.Errorf("Failed to parse mesage from %s: %s", from.name, err)
+		c.logEvent(from, "Failed to parse message: "+err.Error())
 		return false
 	}
 
@@ -490,7 +525,7 @@ func (c *client) unsealMessage(inboxMsg *InboxMessage, from *Contact) bool {
 
 	if from.ratchet == nil {
 		if l := len(msg.MyNextDh); l != len(from.theirCurrentDHPublic) {
-			c.log.Errorf("Message from %s with bad DH length %d", from.name, l)
+			c.logEvent(from, fmt.Sprintf("Bad Diffie-Hellman value length: %d", l))
 			return false
 		}
 

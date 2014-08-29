@@ -1,5 +1,3 @@
-// +build !darwin
-
 package main
 
 import (
@@ -40,8 +38,8 @@ var cliCommands = []cliCommand{
 	{"clear", clearCommand{}, "Clear terminal", 0},
 	{"close", closeCommand{}, "Close currently opened object", contextDraft | contextInbox | contextOutbox | contextContact},
 	{"compose", composeCommand{}, "Compose a new message", contextContact},
-	{"contacts", contactsCommand{}, "Show all known contacts", 0},
-	{"delete", deleteCommand{}, "Delete a message or contact", contextContact | contextDraft},
+	{"contacts", showContactsCommand{}, "Show all known contacts", 0},
+	{"delete", deleteCommand{}, "Delete a message or contact", contextContact | contextDraft | contextInbox | contextOutbox},
 	{"download", downloadCommand{}, "Download a numbered detachment to disk", contextInbox},
 	{"drafts", showDraftsSummaryCommand{}, "Show drafts", 0},
 	{"edit", editCommand{}, "Edit the draft message", contextDraft},
@@ -56,7 +54,10 @@ var cliCommands = []cliCommand{
 	{"remove", removeCommand{}, "Remove an attachment or detachment from a draft message", contextDraft},
 	{"rename", renameCommand{}, "Rename an existing contact", contextContact},
 	{"reply", replyCommand{}, "Reply to the current message", contextInbox},
+	{"retain", retainCommand{}, "Retain the current message", contextInbox},
+	{"dont-retain", dontRetainCommand{}, "Do not retain the current message", contextInbox},
 	{"save", saveCommand{}, "Save a numbered attachment to disk", contextInbox},
+	{"save-key", saveKeyCommand{}, "Save the key to a detachment to disk", contextInbox},
 	{"send", sendCommand{}, "Send the current draft", contextDraft},
 	{"show", showCommand{}, "Show the current object", contextDraft | contextInbox | contextOutbox | contextContact},
 	{"status", statusCommand{}, "Show overall Pond status", 0},
@@ -69,14 +70,16 @@ type ackCommand struct{}
 type clearCommand struct{}
 type closeCommand struct{}
 type composeCommand struct{}
-type contactsCommand struct{}
 type deleteCommand struct{}
 type editCommand struct{}
 type logCommand struct{}
 type quitCommand struct{}
 type replyCommand struct{}
+type retainCommand struct{}
+type dontRetainCommand struct{}
 type sendCommand struct{}
 type showCommand struct{}
+type showContactsCommand struct{}
 type showDraftsSummaryCommand struct{}
 type showIdentityCommand struct{}
 type showInboxSummaryCommand struct{}
@@ -102,6 +105,11 @@ type uploadCommand struct {
 }
 
 type saveCommand struct {
+	Number   string
+	Filename string `cli:"filename"`
+}
+
+type saveKeyCommand struct {
 	Number   string
 	Filename string `cli:"filename"`
 }
@@ -375,11 +383,20 @@ func (i *cliInput) processInput(commandsChan chan<- cliTerminalLine) {
 }
 
 func (input *cliInput) showHelp(context inputContext, showAll bool) {
-	examples := make([]string, len(cliCommands))
-	maxLen := 0
-	hasContextCommands := false
+	contextTable := cliTable{
+		heading:      "These commands operate on the current object:",
+		noIndicators: true,
+	}
+	globalTable := cliTable{
+		heading:      "These commands are global:",
+		noIndicators: true,
+	}
 
-	for i, cmd := range cliCommands {
+	if showAll {
+		globalTable.heading = "All commands:"
+	}
+
+	for _, cmd := range cliCommands {
 		if !showAll && cmd.context != 0 && context&cmd.context == 0 {
 			continue
 		}
@@ -393,44 +410,20 @@ func (input *cliInput) showHelp(context inputContext, showAll bool) {
 				line += " <" + strings.ToLower(prototype.Field(j).Name) + ">"
 			}
 		}
-		if l := len(line); l > maxLen {
-			maxLen = l
+
+		table := &globalTable
+		if context&cmd.context != 0 {
+			table = &contextTable
 		}
-		examples[i] = line
-		if !showAll && context&cmd.context != 0 {
-			hasContextCommands = true
-		}
+		table.rows = append(table.rows, cliRow{
+			cols: []string{line, cmd.desc},
+		})
 	}
 
-	printCommand := func(i int, cmd *cliCommand) {
-		line := examples[i]
-		numSpaces := 1 + (maxLen - len(line))
-		for j := 0; j < numSpaces; j++ {
-			line += " "
-		}
-		line += cmd.desc
-		fmt.Fprintf(input.term, "%s %s\n", termInfoPrefix, line)
-	}
-
-	if hasContextCommands {
-		fmt.Fprintf(input.term, "%s These commands operate on the current object:\n\n", termInfoPrefix)
-
-		for i, cmd := range cliCommands {
-			if context&cmd.context == 0 {
-				continue
-			}
-			printCommand(i, &cmd)
-		}
-
-		fmt.Fprintf(input.term, "\n%s These commands are global:\n\n", termInfoPrefix)
-	}
-
-	for i, cmd := range cliCommands {
-		if !showAll && cmd.context != 0 {
-			continue
-		}
-
-		printCommand(i, &cmd)
+	widths := globalTable.UpdateWidths(contextTable.UpdateWidths(nil))
+	globalTable.WriteToWithWidths(input.term, widths)
+	if len(contextTable.rows) > 0 {
+		contextTable.WriteToWithWidths(input.term, widths)
 	}
 }
 

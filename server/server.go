@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"code.google.com/p/goprotobuf/proto"
+	"github.com/agl/ed25519"
 	"github.com/agl/pond/bbssig"
 	pond "github.com/agl/pond/protos"
 	"github.com/agl/pond/transport"
@@ -33,21 +37,34 @@ const (
 	// maxRevocations is the maximum number of revocations that we'll store
 	// on disk for any one account.
 	maxRevocations = 100
-	// maxFilesCount is the maximum number of uploads for a single account.
+	// maxFilesCount is the default, maximum number of uploads for a single
+	// account. This can be overridden by a "quota-files" file in the
+	// account directory.
 	maxFilesCount = 100
-	// maxFilesSize is the maximum number of bytes for all uploads for a single account.
-	maxFilesSize = 100 * 1024 * 1024
+	// maxFilesMB is the default, maximum number of megabytes for all
+	// uploads for a single account. This can be overridden by a
+	// "quota-megabytes" file in the account directory.
+	maxFilesMB = 100
+	// hmacValueMask is the bottom 63 bits. This is used for HMAC values
+	// where the HMAC is only 63 bits wide and the MSB is used to signal
+	// whether a revocation was used or not.
+	hmacValueMask = 0x7fffffffffffffff
+	// hmacMaxLength is the maximum size, in bytes, of an HMAC strike
+	// file. This is 256K entries.
+	hmacMaxLength = 2 * 1024 * 1024
 )
 
 type Account struct {
 	sync.Mutex
 
-	server     *Server
-	id         [32]byte
-	group      *bbssig.Group
-	filesValid bool
-	filesCount int
-	filesSize  int64
+	server       *Server
+	id           [32]byte
+	group        *bbssig.Group
+	filesValid   bool
+	filesCount   int64
+	filesSize    int64
+	hmacKey      [32]byte
+	hmacKeyValid bool
 }
 
 func NewAccount(s *Server, id *[32]byte) *Account {
@@ -56,6 +73,207 @@ func NewAccount(s *Server, id *[32]byte) *Account {
 	}
 	copy(a.id[:], id[:])
 	return a
+}
+
+func (a *Account) HMACKey() (*[32]byte, bool) {
+	a.Lock()
+	defer a.Unlock()
+
+	if a.hmacKeyValid {
+		return &a.hmacKey, true
+	}
+
+	keyPath := a.HMACKeyPath()
+	keyBytes, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		return nil, false
+	}
+	if len(keyBytes) != len(a.hmacKey) {
+		log.Printf("Incorrect hmacKey length for %s", keyPath)
+		return nil, false
+	}
+
+	copy(a.hmacKey[:], keyBytes)
+	a.hmacKeyValid = true
+
+	return &a.hmacKey, true
+}
+
+// findHMAC finds v in hmacBytes. If found it returns zero and true. Otherwise
+// it returns the index where the value should be inserted and false.
+func findHMAC(hmacBytes []byte, v uint64) (insertIndex int, msb bool, found bool) {
+	v &= hmacValueMask
+
+	searchMin, searchMax := 0, len(hmacBytes)/8-1
+	for searchMin <= searchMax {
+		midPoint := searchMin + ((searchMax - searchMin) / 2)
+		midValue := binary.LittleEndian.Uint64(hmacBytes[midPoint*8:])
+		maskedMidValue := midValue & hmacValueMask
+
+		switch {
+		case maskedMidValue > v:
+			searchMax = midPoint - 1
+		case maskedMidValue < v:
+			searchMin = midPoint + 1
+		default:
+			return 0, maskedMidValue != midValue, true
+		}
+	}
+
+	return searchMin, false, false
+}
+
+func readHMACs(path string, overhead int) (f *os.File, hmacBytes []byte, ok bool) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		log.Printf("Failed to open HMAC strike file %s", err)
+		return
+	}
+
+	fi, err := f.Stat()
+	var size int64
+	if err != nil {
+		log.Printf("Failed to stat HMAC strike file %s", err)
+		goto err
+	}
+
+	size = fi.Size()
+
+	if size%8 != 0 {
+		log.Printf("HMAC strike file is not a multiple of 8: %s", path)
+		goto err
+	}
+
+	if size > hmacMaxLength {
+		log.Printf("HMAC strike file is too large: %s", path)
+		goto err
+	}
+
+	hmacBytes = make([]byte, size, size+int64(overhead))
+
+	if _, err := io.ReadFull(f, hmacBytes); err != nil {
+		log.Printf("Failed to read HMAC strike file %s", err)
+		goto err
+	}
+
+	ok = true
+	return
+
+err:
+	f.Close()
+	return
+}
+
+type hmacInsertResult int
+
+const (
+	hmacFresh hmacInsertResult = iota
+	hmacUsed
+	hmacRevoked
+)
+
+func insertHMAC(path string, v uint64) (result hmacInsertResult, ok bool) {
+	f, hmacBytes, ok := readHMACs(path, 0)
+	if !ok {
+		return hmacUsed, false
+	}
+	defer f.Close()
+
+	insertIndex, msb, found := findHMAC(hmacBytes, v)
+	if found {
+		if msb {
+			return hmacRevoked, true
+		}
+		return hmacUsed, true
+	}
+
+	var serialised [8]byte
+	binary.LittleEndian.PutUint64(serialised[:], v)
+
+	f.Seek(int64(insertIndex)*8, 0)
+	if _, err := f.Write(serialised[:]); err != nil {
+		log.Printf("Failed to write to HMAC file: %s", err)
+		return hmacUsed, false
+	}
+	if _, err := f.Write(hmacBytes[insertIndex*8:]); err != nil {
+		log.Printf("Failed to write to HMAC file: %s", err)
+		return hmacUsed, false
+	}
+
+	return hmacFresh, true
+}
+
+func (a *Account) InsertHMAC(v uint64) (result hmacInsertResult, ok bool) {
+	if v&hmacValueMask != v {
+		panic("unmasked value given to InsertHMAC")
+	}
+
+	a.Lock()
+	defer a.Unlock()
+
+	return insertHMAC(a.HMACValuesPath(), v)
+}
+
+type hmacVector []byte
+
+func (hmacs hmacVector) Len() int {
+	return len(hmacs) / 8
+}
+
+func (hmacs hmacVector) Less(i, j int) bool {
+	iVal := binary.LittleEndian.Uint64(hmacs[8*i:]) & hmacValueMask
+	jVal := binary.LittleEndian.Uint64(hmacs[8*j:]) & hmacValueMask
+
+	return iVal < jVal
+}
+
+func (hmacs hmacVector) Swap(i, j int) {
+	var tmp [8]byte
+	copy(tmp[:], hmacs[8*i:])
+	copy(hmacs[i*8:(i+1)*8], hmacs[8*j:])
+	copy(hmacs[j*8:], tmp[:])
+}
+
+func insertHMACs(path string, vs []uint64) bool {
+	switch len(vs) {
+	case 0:
+		return true
+	case 1:
+		_, ok := insertHMAC(path, vs[0])
+		return ok
+	}
+
+	f, hmacBytes, ok := readHMACs(path, 8*len(vs))
+	if !ok {
+		return false
+	}
+	defer f.Close()
+
+	var serialised [8]byte
+	for _, v := range vs {
+		if _, _, found := findHMAC(hmacBytes, v); found {
+			continue
+		}
+		binary.LittleEndian.PutUint64(serialised[:], v)
+		hmacBytes = append(hmacBytes, serialised[:]...)
+	}
+
+	sort.Sort(hmacVector(hmacBytes))
+
+	f.Seek(0, 0)
+	if _, err := f.Write(hmacBytes); err != nil {
+		log.Printf("Failed to write to HMAC file: %s", err)
+		return false
+	}
+
+	return true
+}
+
+func (a *Account) InsertHMACs(vs []uint64) bool {
+	a.Lock()
+	defer a.Unlock()
+
+	return insertHMACs(a.HMACValuesPath(), vs)
 }
 
 func (a *Account) Group() *bbssig.Group {
@@ -92,6 +310,14 @@ func (a *Account) FilePath() string {
 
 func (a *Account) RevocationPath() string {
 	return filepath.Join(a.Path(), "revocations")
+}
+
+func (a *Account) HMACKeyPath() string {
+	return filepath.Join(a.Path(), "hmackey")
+}
+
+func (a *Account) HMACValuesPath() string {
+	return filepath.Join(a.Path(), "hmacstrike")
 }
 
 func (a *Account) LoadFileInfo() bool {
@@ -139,6 +365,27 @@ func (a *Account) loadFileInfo() bool {
 	return true
 }
 
+func (a *Account) numericConfig(name string, defValue int64) (int64, error) {
+	path := filepath.Join(a.Path(), name)
+	contents, err := ioutil.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return defValue, err
+		}
+		return defValue, nil
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(contents)), 10, 64)
+}
+
+func (a *Account) QuotaBytes() (int64, error) {
+	mb, err := a.numericConfig("quota-megabytes", maxFilesMB)
+	return 1024 * 1024 * mb, err
+}
+
+func (a *Account) QuotaFiles() (int64, error) {
+	return a.numericConfig("quota-files", maxFilesCount)
+}
+
 func (a *Account) ReserveFile(newFile bool, size int64) bool {
 	a.Lock()
 	defer a.Unlock()
@@ -160,7 +407,17 @@ func (a *Account) ReserveFile(newFile bool, size int64) bool {
 		return false
 	}
 
-	if newCount > maxFilesCount || newSize > maxFilesSize {
+	maxFiles, err := a.QuotaFiles()
+	if err != nil {
+		log.Printf("Error from QuotaFiles for %x: %s", a.id[:], err)
+	}
+
+	maxBytes, err := a.QuotaBytes()
+	if err != nil {
+		log.Printf("Error from QuotaBytes for %x: %s", a.id[:], err)
+	}
+
+	if newCount > maxFiles || newSize > maxBytes {
 		return false
 	}
 
@@ -194,13 +451,15 @@ type Server struct {
 	accounts map[string]*Account
 	// lastSweepTime is the time when the server last performed a sweep for
 	// expired files.
-	lastSweepTime time.Time
+	lastSweepTime     time.Time
+	allowRegistration bool
 }
 
-func NewServer(dir string) *Server {
+func NewServer(dir string, allowRegistration bool) *Server {
 	return &Server{
-		baseDirectory: dir,
-		accounts:      make(map[string]*Account),
+		baseDirectory:     dir,
+		accounts:          make(map[string]*Account),
+		allowRegistration: allowRegistration,
 	}
 }
 
@@ -215,27 +474,32 @@ func (s *Server) Process(conn *transport.Conn) {
 	var reply *pond.Reply
 	var messageFetched string
 
-	if req.NewAccount != nil {
+	switch {
+	case req.NewAccount != nil:
 		reply = s.newAccount(from, req.NewAccount)
-	} else if req.Deliver != nil {
+	case req.Deliver != nil:
 		reply = s.deliver(from, req.Deliver)
-	} else if req.Fetch != nil {
+	case req.Fetch != nil:
 		reply, messageFetched = s.fetch(from, req.Fetch)
-	} else if req.Upload != nil {
+	case req.Upload != nil:
 		reply = s.upload(from, conn, req.Upload)
 		if reply == nil {
 			// Connection will be handled by upload.
 			return
 		}
-	} else if req.Download != nil {
+	case req.Download != nil:
 		reply = s.download(conn, req.Download)
 		if reply == nil {
 			// Connection will be handled by download.
 			return
 		}
-	} else if req.Revocation != nil {
+	case req.Revocation != nil:
 		reply = s.revocation(from, req.Revocation)
-	} else {
+	case req.HmacSetup != nil:
+		reply = s.hmacSetup(from, req.HmacSetup)
+	case req.HmacStrike != nil:
+		reply = s.hmacStrike(from, req.HmacStrike)
+	default:
 		reply = &pond.Reply{Status: pond.Reply_NO_REQUEST.Enum()}
 	}
 
@@ -333,6 +597,11 @@ func (s *Server) sweep() {
 func (s *Server) newAccount(from *[32]byte, req *pond.NewAccount) *pond.Reply {
 	account := NewAccount(s, from)
 
+	if !s.allowRegistration {
+		log.Printf("rejected registration of new account")
+		return &pond.Reply{Status: pond.Reply_REGISTRATION_DISABLED.Enum()}
+	}
+
 	var ok bool
 	account.group, ok = new(bbssig.Group).Unmarshal(req.Group)
 	if !ok {
@@ -348,6 +617,10 @@ func (s *Server) newAccount(from *[32]byte, req *pond.NewAccount) *pond.Reply {
 		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
 	}
 
+	if l := len(req.HmacKey); l != 0 && l != len(account.hmacKey) {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+
 	if err := os.MkdirAll(path, 0700); err != nil {
 		log.Printf("failed to create directory: %s", err)
 		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}
@@ -356,6 +629,15 @@ func (s *Server) newAccount(from *[32]byte, req *pond.NewAccount) *pond.Reply {
 	if err := ioutil.WriteFile(filepath.Join(path, "group"), req.Group, 0600); err != nil {
 		log.Printf("failed to write group file: %s", err)
 		goto err
+	}
+
+	if len(req.HmacKey) > 0 {
+		if err := ioutil.WriteFile(account.HMACKeyPath(), req.HmacKey, 0600); err != nil {
+			log.Printf("failed to write HMAC key file: %s", err)
+			goto err
+		}
+		copy(account.hmacKey[:], req.HmacKey)
+		account.hmacKeyValid = true
 	}
 
 	s.Lock()
@@ -405,25 +687,14 @@ func (s *Server) getAccount(id *[32]byte) (*Account, bool) {
 	return account, true
 }
 
-func (s *Server) deliver(from *[32]byte, del *pond.Delivery) *pond.Reply {
-	var to [32]byte
-	if len(del.To) != len(to) {
-		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
-	}
-	copy(to[:], del.To)
-
-	account, ok := s.getAccount(&to)
-	if !ok {
-		return &pond.Reply{Status: pond.Reply_NO_SUCH_ADDRESS.Enum()}
-	}
-
+func authenticateDeliveryWithGroupSignature(account *Account, del *pond.Delivery) (*pond.Reply, bool) {
 	revPath := filepath.Join(account.RevocationPath(), fmt.Sprintf("%08x", *del.Generation))
 	revBytes, err := ioutil.ReadFile(revPath)
 	if err == nil {
 		var revocation pond.SignedRevocation
 		if err := proto.Unmarshal(revBytes, &revocation); err != nil {
 			log.Printf("Failed to parse revocation from file %s: %s", revPath, err)
-			return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}
+			return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}, false
 		}
 
 		// maxRevocationBytes is the maximum number of bytes that we'll
@@ -448,7 +719,7 @@ func (s *Server) deliver(from *[32]byte, del *pond.Delivery) *pond.Reply {
 			revLength += len(revBytes)
 		}
 
-		return &pond.Reply{Status: pond.Reply_GENERATION_REVOKED.Enum(), Revocation: &revocation, ExtraRevocations: extraRevocations}
+		return &pond.Reply{Status: pond.Reply_GENERATION_REVOKED.Enum(), Revocation: &revocation, ExtraRevocations: extraRevocations}, false
 	}
 
 	sha := sha256.New()
@@ -458,11 +729,104 @@ func (s *Server) deliver(from *[32]byte, del *pond.Delivery) *pond.Reply {
 
 	group := account.Group()
 	if group == nil {
-		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}
+		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}, false
 	}
 
-	if !group.Verify(digest, sha, del.Signature) {
-		return &pond.Reply{Status: pond.Reply_DELIVERY_SIGNATURE_INVALID.Enum()}
+	if !group.Verify(digest, sha, del.GroupSignature) {
+		return &pond.Reply{Status: pond.Reply_DELIVERY_SIGNATURE_INVALID.Enum()}, false
+	}
+
+	return nil, true
+}
+
+func authenticateDeliveryWithHMAC(account *Account, del *pond.Delivery) (*pond.Reply, bool) {
+	if len(del.OneTimePublicKey) != ed25519.PublicKeySize || len(del.OneTimeSignature) != ed25519.SignatureSize {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}, false
+	}
+
+	hmacKey, ok := account.HMACKey()
+	if !ok {
+		return &pond.Reply{Status: pond.Reply_HMAC_NOT_SETUP.Enum()}, false
+	}
+
+	if x := *del.HmacOfPublicKey; x&hmacValueMask != x {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}, false
+	}
+
+	h := hmac.New(sha256.New, hmacKey[:])
+	h.Write(del.OneTimePublicKey)
+	digestFull := h.Sum(nil)
+	digest := binary.LittleEndian.Uint64(digestFull) & hmacValueMask
+
+	if digest != *del.HmacOfPublicKey {
+		return &pond.Reply{Status: pond.Reply_HMAC_INCORRECT.Enum()}, false
+	}
+
+	var publicKey [ed25519.PublicKeySize]byte
+	var sig [ed25519.SignatureSize]byte
+	copy(publicKey[:], del.OneTimePublicKey)
+	copy(sig[:], del.OneTimeSignature)
+
+	if !ed25519.Verify(&publicKey, del.Message, &sig) {
+		return &pond.Reply{Status: pond.Reply_DELIVERY_SIGNATURE_INVALID.Enum()}, false
+	}
+
+	result, ok := account.InsertHMAC(digest)
+	if !ok {
+		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}, false
+	}
+	switch result {
+	case hmacUsed:
+		return &pond.Reply{Status: pond.Reply_HMAC_USED.Enum()}, false
+	case hmacRevoked:
+		return &pond.Reply{Status: pond.Reply_HMAC_REVOKED.Enum()}, false
+	case hmacFresh:
+		return nil, true
+	default:
+		panic("should not happen")
+	}
+}
+
+func (s *Server) deliver(from *[32]byte, del *pond.Delivery) *pond.Reply {
+	var to [32]byte
+	if len(del.To) != len(to) {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+	copy(to[:], del.To)
+
+	if b := len(del.OneTimePublicKey) > 0; b != (del.HmacOfPublicKey != nil) || b != (len(del.OneTimeSignature) > 0) {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+
+	if (len(del.GroupSignature) > 0) != (del.Generation != nil) {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+
+	hmacAuthenticated := len(del.OneTimePublicKey) > 0
+	groupSignatureAuthenticated := len(del.GroupSignature) > 0
+
+	if hmacAuthenticated == groupSignatureAuthenticated {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+
+	account, ok := s.getAccount(&to)
+	if !ok {
+		return &pond.Reply{Status: pond.Reply_NO_SUCH_ADDRESS.Enum()}
+	}
+
+	switch {
+	case groupSignatureAuthenticated:
+		reply, ok := authenticateDeliveryWithGroupSignature(account, del)
+		if !ok {
+			return reply
+		}
+	case hmacAuthenticated:
+		reply, ok := authenticateDeliveryWithHMAC(account, del)
+		if !ok {
+			return reply
+		}
+	default:
+		panic("internal error")
 	}
 
 	serialized, _ := proto.Marshal(del)
@@ -482,6 +846,11 @@ func (s *Server) deliver(from *[32]byte, del *pond.Delivery) *pond.Reply {
 	if len(ents) > maxQueue {
 		return &pond.Reply{Status: pond.Reply_MAILBOX_FULL.Enum()}
 	}
+
+	sha := sha256.New()
+	sha.Write(del.Message)
+	digest := sha.Sum(nil)
+
 	msgPath := filepath.Join(path, fmt.Sprintf("%x", digest))
 	if err := ioutil.WriteFile(msgPath, serialized, 0600); err != nil {
 		log.Printf("failed to write %s: %s", msgPath, err)
@@ -598,9 +967,9 @@ func (s *Server) fetch(from *[32]byte, fetch *pond.Fetch) (*pond.Reply, string) 
 	}
 
 	fetched := &pond.Fetched{
-		Signature:  del.Signature,
-		Generation: del.Generation,
-		Message:    del.Message,
+		GroupSignature: del.GroupSignature,
+		Generation:     del.Generation,
+		Message:        del.Message,
 		Details: &pond.AccountDetails{
 			Queue:    proto.Uint32(queueLen),
 			MaxQueue: proto.Uint32(0),
@@ -816,6 +1185,48 @@ func (s *Server) revocation(from *[32]byte, signedRevocation *pond.SignedRevocat
 	groupPath := filepath.Join(account.Path(), "group")
 	if err := ioutil.WriteFile(groupPath, groupCopy.Marshal(), 0600); err != nil {
 		log.Printf("failed to write group file: %s", err)
+	}
+
+	return nil
+}
+
+func (s *Server) hmacSetup(from *[32]byte, setup *pond.HMACSetup) *pond.Reply {
+	account, ok := s.getAccount(from)
+	if !ok {
+		return &pond.Reply{Status: pond.Reply_NO_ACCOUNT.Enum()}
+	}
+
+	if len(setup.HmacKey) != len(account.hmacKey) {
+		return &pond.Reply{Status: pond.Reply_PARSE_ERROR.Enum()}
+	}
+
+	existingHMACKey, ok := account.HMACKey()
+	if ok {
+		if subtle.ConstantTimeCompare(setup.HmacKey, existingHMACKey[:]) == 1 {
+			return &pond.Reply{Status: pond.Reply_OK.Enum()}
+		} else {
+			return &pond.Reply{Status: pond.Reply_HMAC_KEY_ALREADY_SET.Enum()}
+		}
+	}
+
+	if err := ioutil.WriteFile(account.HMACKeyPath(), setup.HmacKey, 0600); err != nil {
+		log.Printf("failed to write HMAC key file: %s", err)
+		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}
+	}
+	copy(account.hmacKey[:], setup.HmacKey)
+	account.hmacKeyValid = true
+
+	return nil
+}
+
+func (s *Server) hmacStrike(from *[32]byte, strike *pond.HMACStrike) *pond.Reply {
+	account, ok := s.getAccount(from)
+	if !ok {
+		return &pond.Reply{Status: pond.Reply_NO_ACCOUNT.Enum()}
+	}
+
+	if !account.InsertHMACs(strike.Hmacs) {
+		return &pond.Reply{Status: pond.Reply_INTERNAL_ERROR.Enum()}
 	}
 
 	return nil

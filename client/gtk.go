@@ -4,9 +4,11 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 
 	"github.com/agl/go-gtk/gdk"
+	"github.com/agl/go-gtk/gdkpixbuf"
 	"github.com/agl/go-gtk/glib"
 	"github.com/agl/go-gtk/gtk"
 	"github.com/agl/go-gtk/gtkspell"
@@ -380,7 +382,7 @@ func (ui *GTKUI) createWidget(v interface{}) gtk.WidgetLike {
 		}
 		if v.spellCheck {
 			if _, err := gtkspell.New(view, ""); err != nil {
-				panic(err)
+				fmt.Fprintf(os.Stderr, "Failed to setup spellchecker: %s\n", err)
 			}
 		}
 		if name := v.name; len(name) > 0 {
@@ -664,6 +666,7 @@ func (ui *GTKUI) handle(action interface{}) {
 
 	case UIError:
 	case UIState:
+	case UIInfo:
 		// for testing.
 	default:
 		panic("unknown action")
@@ -676,4 +679,20 @@ func colComponent(component uint32) float64 {
 
 func toColor(color uint32) *gdk.GdkRGBA {
 	return gdk.RGBA(colComponent(color>>16), colComponent(color>>8), colComponent(color), 1)
+}
+
+var indicatorImages [indicatorCount]*gdkpixbuf.GdkPixbuf
+
+func (i Indicator) Image() *gdkpixbuf.GdkPixbuf {
+	if indicatorImages[i] == nil {
+		loader, err := gdkpixbuf.PixbufLoaderWithType("png")
+		if err != nil {
+			panic(err)
+		}
+		if ok, err := loader.Write(indicatorPNGBytes[i]); !ok {
+			panic(err)
+		}
+		indicatorImages[i] = loader.GetPixbuf()
+	}
+	return indicatorImages[i]
 }

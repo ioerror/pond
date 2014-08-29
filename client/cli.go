@@ -1,5 +1,3 @@
-// +build !darwin
-
 package main
 
 import (
@@ -12,11 +10,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
-	"code.google.com/p/go.crypto/curve25519"
 	"code.google.com/p/go.crypto/ssh/terminal"
 	"code.google.com/p/goprotobuf/proto"
 	"github.com/agl/pond/client/disk"
@@ -26,6 +25,12 @@ import (
 )
 
 const haveCLI = true
+
+const (
+	tpmIntroMsg      = "It's very difficult to erase information on modern computers so Pond tries to use the TPM chip if possible."
+	tpmPresentMsg    = "Your computer appears to have a TPM chip. You'll need tcsd (the TPM daemon) running in order to use it."
+	tpmNotPresentMsg = "Your computer does not appear to have a TPM chip. Without one, it's possible that someone in physical possession of your computer and passphrase could extract old messages that should have been deleted. Using a computer with a TPM is strongly preferable until alternatives can be implemented."
+)
 
 type cliClient struct {
 	client
@@ -99,6 +104,14 @@ func terminalEscape(s string, lineBreaksOk bool) string {
 	return string(out)
 }
 
+func updateTerminalSize(term *terminal.Terminal) {
+	width, height, err := terminal.GetSize(0)
+	if err != nil {
+		return
+	}
+	term.SetSize(width, height)
+}
+
 func (c *cliClient) Start() {
 	oldState, err := terminal.MakeRaw(0)
 	if err != nil {
@@ -114,9 +127,15 @@ func (c *cliClient) Start() {
 	c.termWrapper = wrapper
 
 	c.term = terminal.NewTerminal(wrapper, "> ")
-	if width, height, err := terminal.GetSize(0); err == nil {
-		c.term.SetSize(width, height)
-	}
+	updateTerminalSize(c.term)
+
+	resizeChan := make(chan os.Signal)
+	go func() {
+		for _ = range resizeChan {
+			updateTerminalSize(c.term)
+		}
+	}()
+	signal.Notify(resizeChan, syscall.SIGWINCH)
 
 	c.loadUI()
 
@@ -251,6 +270,9 @@ func (wrapper *terminalWrapper) run(r io.Reader, interruptChan chan bool) {
 			wrapper.cond.Signal()
 			wrapper.Unlock()
 		}
+		if err != nil {
+			break
+		}
 	}
 }
 
@@ -364,28 +386,55 @@ func (c *cliClient) ShutdownAndSuspend() error {
 
 func (c *cliClient) createPassphraseUI() (string, error) {
 	c.Printf("%s %s\n", termInfoPrefix, msgCreatePassphrase)
-	return c.term.ReadPassword("password> ")
+
+	for {
+		pw1, err := c.term.ReadPassword("passphrase> ")
+		if err != nil {
+			return "", err
+		}
+		if len(pw1) == 0 {
+			return "", nil
+		}
+		c.Printf("%s Please confirm by entering the same passphrase again\n", termInfoPrefix)
+		pw2, err := c.term.ReadPassword("passphrase> ")
+		if err != nil {
+			return "", err
+		}
+		if pw1 == pw2 {
+			return pw1, nil
+		}
+		c.Printf("%s Passphrases don't match. Please start over\n", termInfoPrefix)
+	}
+	return "", nil
 }
 
-func (c *cliClient) createErasureStorage(pw string, stateFile *disk.StateFile) error {
-	c.Printf("%s %s\n", termErrPrefix, "Erasure storage not yet implemented.")
-	stateFile.Erasure = nil
-	return stateFile.Create(pw)
-}
-
-func (c *cliClient) createAccountUI() error {
+func (c *cliClient) createAccountUI(stateFile *disk.StateFile, pw string) (bool, error) {
 	defaultServer := msgDefaultServer
 	if c.dev {
 		defaultServer = msgDefaultDevServer
 	}
 
-	c.Printf("%s %s Just hit enter to use the default server [%s]\n", termInfoPrefix, msgCreateAccount, defaultServer)
+	c.Printf("%s %s\n", termInfoPrefix, msgCreateAccount)
+	c.Printf("%s\n", termInfoPrefix)
+	c.Printf("%s Either leave this blank to use the default server, enter a pondserver:// address, or type one of the following server nicknames:\n", termInfoPrefix)
+	for _, server := range knownServers {
+		if len(server.nickname) == 0 {
+			continue
+		}
+		c.Printf("%s   %s: %s\n", termInfoPrefix, server.nickname, server.description)
+	}
 	c.term.SetPrompt("server> ")
 
 	for {
 		line, err := c.term.ReadLine()
 		if err != nil {
-			return err
+			return false, err
+		}
+		for _, server := range knownServers {
+			if line == server.nickname {
+				line = server.uri
+				break
+			}
 		}
 		if len(line) == 0 {
 			line = defaultServer
@@ -404,7 +453,7 @@ func (c *cliClient) createAccountUI() error {
 		break
 	}
 
-	return nil
+	return false, nil
 }
 
 func (c *cliClient) keyPromptUI(stateFile *disk.StateFile) error {
@@ -436,7 +485,7 @@ func (c *cliClient) processFetch(inboxMsg *InboxMessage) {
 		inboxMsg.cliId = c.newCliId()
 	}
 
-	c.Printf("%s New message (%s%s%s) received from %s\n", termPrefix, termCliIdStart, inboxMsg.cliId.String(), termReset, terminalEscape(c.contacts[inboxMsg.from].name, false))
+	c.Printf("\x07%s (%s) New message (%s%s%s) received from %s\n", termPrefix, time.Now().Format(shortTimeFormat), termCliIdStart, inboxMsg.cliId.String(), termReset, terminalEscape(c.contacts[inboxMsg.from].name, false))
 }
 
 func (c *cliClient) processServerAnnounce(inboxMsg *InboxMessage) {
@@ -444,7 +493,7 @@ func (c *cliClient) processServerAnnounce(inboxMsg *InboxMessage) {
 }
 
 func (c *cliClient) processAcknowledgement(ackedMsg *queuedMessage) {
-	c.Printf("%s Message acknowledged by %s\n", termPrefix, terminalEscape(c.contacts[ackedMsg.to].name, false))
+	c.Printf("%s (%s) Message acknowledged by %s\n", termPrefix, time.Now().Format(shortTimeFormat), terminalEscape(c.contacts[ackedMsg.to].name, false))
 }
 
 func (c *cliClient) processRevocationOfUs(by *Contact) {
@@ -457,10 +506,23 @@ func (c *cliClient) processRevocation(by *Contact) {
 // unsealPendingMessages is run once a key exchange with a contact has
 // completed and unseals any previously unreadable messages from that contact.
 func (c *cliClient) unsealPendingMessages(contact *Contact) {
+	var needToFilter bool
+
 	for _, msg := range c.inbox {
 		if msg.message == nil && msg.from == contact.id {
-			c.unsealMessage(msg, contact)
+			if !c.unsealMessage(msg, contact) {
+				needToFilter = true
+				continue
+			}
+			if len(msg.message.Body) == 0 {
+				needToFilter = true
+				continue
+			}
 		}
+	}
+
+	if needToFilter {
+		c.dropSealedAndAckMessagesFrom(contact)
 	}
 }
 
@@ -479,7 +541,7 @@ func (c *cliClient) processPANDAUpdateUI(update pandaUpdate) {
 
 func (c *cliClient) processMessageDelivered(msg *queuedMessage) {
 	if !msg.revocation && len(msg.message.Body) > 0 {
-		c.Printf("%s Message %s%s%s to %s transmitted successfully\n", termPrefix, termCliIdStart, msg.cliId.String(), termReset, terminalEscape(c.contacts[msg.to].name, false))
+		c.Printf("%s (%s) Message %s%s%s to %s transmitted successfully\n", termPrefix, time.Now().Format(shortTimeFormat), termCliIdStart, msg.cliId.String(), termReset, terminalEscape(c.contacts[msg.to].name, false))
 	}
 	c.showQueueState()
 }
@@ -495,6 +557,10 @@ func (c *cliClient) addRevocationMessageUI(msg *queuedMessage) {
 }
 
 func (c *cliClient) removeContactUI(contact *Contact) {
+}
+
+func (c *cliClient) logEventUI(contact *Contact, event Event) {
+	c.Printf("%s While processing message from %s: %s\n", termWarnPrefix, terminalEscape(contact.name, false), terminalEscape(event.msg, false))
 }
 
 func (c *cliClient) setCurrentObject(o interface{}) {
@@ -582,77 +648,186 @@ func (c *cliClient) mainUI() {
 	}
 }
 
-func (c *cliClient) showState() {
-	c.showInboxSummary()
-	c.showOutboxSummary()
-	c.showDraftsSummary()
-	c.showContacts()
+// cliTable is a structure for containing tabular data for display on the
+// terminal. For example, the inbox, outbox etc summaries are handled using
+// this structure.
+type cliTable struct {
+	// heading is an optional string that will be printed before the table.
+	heading string
+	rows    []cliRow
+	// noIndicators, if true, causes the indicators for each row to be
+	// ignored and a blue hyphen to be printed in their place.
+	noIndicators bool
+	// noTrailingNewline, if true, stops the printing of a newline after
+	// the table.
+	noTrailingNewline bool
+}
 
-	c.Printf("\n")
+// cliRow is a row of terminal data.
+type cliRow struct {
+	// indicator contains an optional indicator star to print at the
+	// beginning of the line.
+	indicator Indicator
+	// cols contains strings for each column. Note that strings must
+	// already have been terminal escaped.
+	cols []string
+	// id contains an optional tag string to print as a final column.
+	id cliId
+}
+
+// UpdateWidths calculates the maximum width of each column. If widths is
+// non-nil then those widths are updated.
+func (tab cliTable) UpdateWidths(widths []int) []int {
+	if len(tab.rows) == 0 {
+		return widths
+	}
+
+	n := len(tab.rows[0].cols)
+	if len(widths) < n {
+		newWidths := make([]int, n)
+		copy(newWidths, widths)
+		widths = newWidths
+	}
+
+	for _, row := range tab.rows {
+		if len(row.cols) != n {
+			panic("table is not square")
+		}
+		for j, col := range row.cols {
+			if widths[j] < len(col) {
+				widths[j] = len(col)
+			}
+		}
+	}
+
+	return widths
+}
+
+// WriteTo writes the terminal data for tab to w.
+func (tab cliTable) WriteTo(w io.Writer) {
+	widths := tab.UpdateWidths(nil)
+	tab.WriteToWithWidths(w, widths)
+}
+
+// WriteToWithWidths writes the terminal data for tab to w using the given
+// widths.
+func (tab cliTable) WriteToWithWidths(w io.Writer, widths []int) {
+	maxWidth := 0
+	for _, width := range widths {
+		if maxWidth < width {
+			maxWidth = width
+		}
+	}
+
+	spaces := make([]byte, maxWidth+1)
+	for i := range spaces {
+		spaces[i] = ' '
+	}
+
+	buf := bufio.NewWriter(w)
+
+	if len(tab.heading) > 0 {
+		buf.WriteString(termInfoPrefix)
+		buf.WriteString(" ")
+		buf.WriteString(tab.heading)
+		buf.WriteString("\n")
+	}
+
+	for _, row := range tab.rows {
+		if tab.noIndicators {
+			buf.WriteString(termHeaderPrefix)
+		} else {
+			buf.WriteString(" ")
+			buf.WriteString(row.indicator.Star())
+		}
+		buf.WriteString(" ")
+
+		for j, width := range widths {
+			var col string
+			if j < len(row.cols) {
+				col = row.cols[j]
+			}
+
+			switch j {
+			case 0:
+			case 1:
+				buf.WriteString(" ")
+				if len(col) > 0 {
+					buf.WriteString(termGray)
+					buf.WriteString("|")
+					buf.WriteString(termReset)
+				} else {
+					buf.WriteString(" ")
+				}
+				buf.WriteString(" ")
+			default:
+				buf.WriteString(" ")
+			}
+			buf.WriteString(col)
+			buf.Write(spaces[:width-len(col)])
+		}
+
+		if row.id != invalidCliId {
+			buf.WriteString(" (")
+			buf.WriteString(termCliIdStart)
+			buf.WriteString(row.id.String())
+			buf.WriteString(termReset)
+			buf.WriteString(")")
+		}
+		buf.WriteString("\n")
+	}
+
+	if len(tab.rows) > 0 && !tab.noTrailingNewline {
+		buf.WriteString("\n")
+	}
+	buf.Flush()
+}
+
+func (c *cliClient) showState() {
+	tables := make([]cliTable, 0, 4)
+
+	tables = append(tables, c.outboxSummary())
+	tables = append(tables, c.inboxSummary())
+	tables = append(tables, c.draftsSummary())
+	tables = append(tables, c.contactsSummary())
+
+	var widths []int
+	for _, table := range tables {
+		widths = table.UpdateWidths(widths)
+	}
+
+	for _, table := range tables {
+		table.WriteToWithWidths(c.term, widths)
+	}
+
 	c.showQueueState()
 }
 
-func (c *cliClient) showContacts() {
-	if len(c.contacts) > 0 {
-		c.Printf("\n%s Contacts:\n", termPrefix)
-	}
-	for _, contact := range c.contacts {
-		if contact.cliId == invalidCliId {
-			contact.cliId = c.newCliId()
-		}
-		c.Printf("   %s %s (%s%s%s)\n", terminalEscape(contact.name, false), contact.subline(), termCliIdStart, contact.cliId.String(), termReset)
-	}
-
-	c.Printf("\n")
-}
-
-func (c *cliClient) showQueueState() {
-	c.queueMutex.Lock()
-	queueLength := len(c.queue)
-	c.queueMutex.Unlock()
-	switch {
-	case queueLength > 1:
-		c.Printf("%s There are %d messages waiting to be transmitted\n", termInfoPrefix, queueLength)
-	case queueLength > 0:
-		c.Printf("%s There is one message waiting to be transmitted\n", termInfoPrefix)
-	default:
-		c.Printf("%s There are no messages waiting to be transmitted\n", termInfoPrefix)
-	}
-}
-
-func (c *cliClient) showOutboxSummary() {
-	if len(c.outbox) > 0 {
-		c.Printf("%s Outbox:\n", termPrefix)
-	}
-	for _, msg := range c.outbox {
-		if msg.revocation {
-			c.Printf(" %s Revocation : %s\n", msg.indicator(nil).Star(), msg.created.Format(shortTimeFormat))
-			continue
-		}
-		if len(msg.message.Body) > 0 {
-			if msg.cliId == invalidCliId {
-				msg.cliId = c.newCliId()
-			}
-
-			subline := msg.created.Format(shortTimeFormat)
-			c.Printf(" %s %s : %s (%s%s%s)\n", msg.indicator(c.contacts[msg.to]).Star(), terminalEscape(c.contacts[msg.to].name, false), subline, termCliIdStart, msg.cliId.String(), termReset)
-		}
-	}
-}
-
 func (c *cliClient) showIdentity() {
-	c.Printf("%s Identity:\n", termPrefix)
-	c.Printf("    Server: %s\n", c.server)
-	c.Printf("    Public Identity: %x\n", c.identityPublic[:])
-	c.Printf("    Public Key: %x\n", c.pub[:])
-	c.Printf("    State File: %s\n", c.stateFilename)
-	c.Printf("    Group Generation: %d\n", c.generation)
+	table := cliTable{
+		noIndicators: true,
+		heading:      "Identity",
+		rows: []cliRow{
+			cliRow{cols: []string{"Server", terminalEscape(c.server, false)}},
+			cliRow{cols: []string{"Public identity", fmt.Sprintf("%x", c.identityPublic[:])}},
+			cliRow{cols: []string{"Public key", fmt.Sprintf("%x", c.pub[:])}},
+			cliRow{cols: []string{"State file", terminalEscape(c.stateFilename, false)}},
+			cliRow{cols: []string{"Group generation", fmt.Sprintf("%d", c.generation)}},
+		},
+	}
+	table.WriteTo(c.term)
 }
 
-func (c *cliClient) showInboxSummary() {
-	if len(c.inbox) > 0 {
-		c.Printf("%s Inbox:\n", termPrefix)
+func (c *cliClient) inboxSummary() (table cliTable) {
+	if len(c.inbox) == 0 {
+		return
 	}
+
+	table = cliTable{
+		heading: "Inbox",
+		rows:    make([]cliRow, 0, len(c.inbox)),
+	}
+
 	for _, msg := range c.inbox {
 		var subline string
 		i := indicatorNone
@@ -665,6 +840,8 @@ func (c *cliClient) showInboxSummary() {
 			}
 			if !msg.read {
 				i = indicatorBlue
+			} else if !msg.acked {
+				i = indicatorYellow
 			}
 			subline = time.Unix(*msg.message.Time, 0).Format(shortTimeFormat)
 		}
@@ -676,25 +853,165 @@ func (c *cliClient) showInboxSummary() {
 			msg.cliId = c.newCliId()
 		}
 
-		c.Printf(" %s %s : %s (%s%s%s)\n", i.Star(), terminalEscape(fromString, false), subline, termCliIdStart, msg.cliId.String(), termReset)
+		table.rows = append(table.rows, cliRow{
+			i,
+			[]string{
+				terminalEscape(fromString, false),
+				subline,
+			},
+			msg.cliId,
+		})
 	}
+
+	return
 }
 
-func (c *cliClient) showDraftsSummary() {
-	if len(c.drafts) > 0 {
-		c.Printf("\n%s Drafts:\n", termPrefix)
+func (c *cliClient) outboxSummary() (table cliTable) {
+	if len(c.outbox) == 0 {
+		return
 	}
+
+	table = cliTable{
+		heading: "Outbox",
+		rows:    make([]cliRow, 0, len(c.outbox)),
+	}
+
+	for _, msg := range c.outbox {
+		subline := msg.created.Format(shortTimeFormat)
+
+		if msg.revocation {
+			table.rows = append(table.rows, cliRow{
+				msg.indicator(nil),
+				[]string{
+					"(Revocation)",
+					subline,
+				},
+				invalidCliId,
+			})
+			continue
+		}
+
+		if len(msg.message.Body) == 0 {
+			continue
+		}
+
+		if msg.cliId == invalidCliId {
+			msg.cliId = c.newCliId()
+		}
+
+		to := c.contacts[msg.to]
+		table.rows = append(table.rows, cliRow{
+			msg.indicator(to),
+			[]string{
+				terminalEscape(to.name, false),
+				subline,
+			},
+			msg.cliId,
+		})
+	}
+
+	return
+}
+
+func (c *cliClient) draftsSummary() (table cliTable) {
+	if len(c.drafts) == 0 {
+		return
+	}
+
+	table = cliTable{
+		heading: "Drafts",
+		rows:    make([]cliRow, 0, len(c.drafts)),
+	}
+
 	for _, msg := range c.drafts {
 		if msg.cliId == invalidCliId {
 			msg.cliId = c.newCliId()
 		}
 
 		subline := msg.created.Format(shortTimeFormat)
-		to := ""
+		to := "(nobody)"
 		if msg.to != 0 {
 			to = c.contacts[msg.to].name
 		}
-		c.Printf("   %s : %s (%s%s%s)\n", terminalEscape(to, false), subline, termCliIdStart, msg.cliId.String(), termReset)
+
+		table.rows = append(table.rows, cliRow{
+			indicatorNone,
+			[]string{
+				terminalEscape(to, false),
+				subline,
+			},
+			msg.cliId,
+		})
+	}
+
+	return
+}
+
+type contactList []*Contact
+
+func (cl contactList) Len() int {
+	return len(cl)
+}
+
+func (cl contactList) Less(i, j int) bool {
+	return cl[i].name < cl[j].name
+}
+
+func (cl contactList) Swap(i, j int) {
+	cl[i], cl[j] = cl[j], cl[i]
+}
+
+func (c *cliClient) contactsSummary() (table cliTable) {
+	if len(c.contacts) == 0 {
+		return
+	}
+
+	table = cliTable{
+		heading: "Contacts",
+		rows:    make([]cliRow, 0, len(c.contacts)),
+	}
+
+	contacts := contactList(make([]*Contact, 0, len(c.contacts)))
+	for i := range c.contacts {
+		contacts = append(contacts, c.contacts[i])
+	}
+
+	sort.Sort(contacts)
+
+	for _, contact := range contacts {
+		if contact.cliId == invalidCliId {
+			contact.cliId = c.newCliId()
+		}
+		indicator := indicatorNone
+		if contact.revokedUs {
+			indicator = indicatorBlack
+		}
+
+		table.rows = append(table.rows, cliRow{
+			indicator,
+			[]string{
+				terminalEscape(contact.name, false),
+				contact.subline(),
+			},
+			contact.cliId,
+		})
+	}
+
+	return
+}
+
+func (c *cliClient) showQueueState() {
+	c.queueMutex.Lock()
+	queueLength := len(c.queue)
+	c.queueMutex.Unlock()
+
+	switch {
+	case queueLength > 1:
+		c.Printf("%s There are %d messages waiting to be transmitted\n", termInfoPrefix, queueLength)
+	case queueLength > 0:
+		c.Printf("%s There is one message waiting to be transmitted\n", termInfoPrefix)
+	default:
+		c.Printf("%s There are no messages waiting to be transmitted\n", termInfoPrefix)
 	}
 }
 
@@ -784,8 +1101,6 @@ func (c *cliClient) processCommand(cmd interface{}) (shouldQuit bool) {
 			c.Printf("%s Select contact first\n", termWarnPrefix)
 		}
 
-	case contactsCommand:
-		c.showContacts()
 	case editCommand:
 		if draft, ok := c.currentObj.(*Draft); ok {
 			c.compose(nil, draft, nil)
@@ -875,9 +1190,21 @@ Handle:
 		if l := len(c.log.entries); l < n {
 			n = l
 		}
-		for _, entry := range c.log.entries[len(c.log.entries)-n:] {
-			c.Printf("%s (%s) %s\n", termHeaderPrefix, entry.Format(logTimeFormat), terminalEscape(entry.s, false))
+		table := cliTable{
+			rows:         make([]cliRow, 0, n),
+			noIndicators: true,
 		}
+
+		for _, entry := range c.log.entries[len(c.log.entries)-n:] {
+			table.rows = append(table.rows, cliRow{
+				cols: []string{
+					entry.Format(logTimeFormat),
+					terminalEscape(entry.s, false),
+				},
+			})
+		}
+
+		table.WriteTo(c.term)
 
 	case transactNowCommand:
 		c.Printf("%s Triggering immediate network transaction.\n", termPrefix)
@@ -900,18 +1227,51 @@ Handle:
 			c.Printf("%s Select object first\n", termWarnPrefix)
 			return
 		}
-		switch o := c.currentObj.(type) {
-		case *Draft:
-			delete(c.drafts, o.id)
-			c.save()
-			c.setCurrentObject(nil)
+		if !c.deleteArmed {
+			switch obj := c.currentObj.(type) {
+			case *Contact:
+				c.Printf("%s You attempted to delete a contact (%s). Doing so removes all messages to and from that contact and revokes their ability to send you messages. To confirm, enter the delete command again.\n", termWarnPrefix, terminalEscape(obj.name, false))
+			case *Draft:
+				toName := "<unknown>"
+				if obj.to != 0 {
+					toName = c.contacts[obj.to].name
+				}
+				c.Printf("%s You attempted to delete a draft message (to %s). To confirm, enter the delete command again.\n", termWarnPrefix, terminalEscape(toName, false))
+			case *queuedMessage:
+				c.queueMutex.Lock()
+				if c.indexOfQueuedMessage(obj) != -1 {
+					c.queueMutex.Unlock()
+					c.Printf("%s Please abort the unsent message before deleting it.\n", termErrPrefix)
+					return
+				}
+				c.queueMutex.Unlock()
+				c.Printf("%s You attempted to delete a message (to %s). To confirm, enter the delete command again.\n", termWarnPrefix, terminalEscape(c.contacts[obj.to].name, false))
+			case *InboxMessage:
+				c.Printf("%s You attempted to delete a message (from %s). To confirm, enter the delete command again.\n", termWarnPrefix, terminalEscape(c.contacts[obj.from].name, false))
+			default:
+				c.Printf("%s Cannot delete current object\n", termWarnPrefix)
+				return
+			}
+			c.deleteArmed = true
+			return
+		}
+		c.deleteArmed = false
+
+		switch obj := c.currentObj.(type) {
 		case *Contact:
-			c.maybeDeleteContact(o)
-			// maybeDeleteContact may need confirmation so
-			// setCurrentObject is handled in there.
+			c.deleteContact(obj)
+		case *Draft:
+			delete(c.drafts, obj.id)
+		case *queuedMessage:
+			c.deleteOutboxMsg(obj.id)
+		case *InboxMessage:
+			c.deleteInboxMsg(obj.id)
 		default:
 			c.Printf("%s Cannot delete current object\n", termWarnPrefix)
+			return
 		}
+		c.setCurrentObject(nil)
+		c.save()
 
 	case sendCommand:
 		draft, ok := c.currentObj.(*Draft)
@@ -919,36 +1279,13 @@ Handle:
 			c.Printf("%s Select draft first\n", termWarnPrefix)
 			return
 		}
-		to := c.contacts[draft.to]
-		var myNextDH []byte
-		if to.ratchet == nil {
-			var nextDHPub [32]byte
-			curve25519.ScalarBaseMult(&nextDHPub, &to.currentDHPrivate)
-			myNextDH = nextDHPub[:]
+		if draft.to == 0 {
+			c.Printf("%s Draft was created in the GUI and doesn't have a destination specified. Please use the GUI to manipulate this draft.\n", termErrPrefix)
+			return
 		}
-
-		if len(draft.body) == 0 {
-			// Zero length bodies are ACKs.
-			draft.body = " "
-		}
-		id := c.randId()
-		var inReplyTo *uint64
-		if r := draft.inReplyTo; r != 0 {
-			inReplyTo = proto.Uint64(r)
-		}
-		err := c.send(to, &pond.Message{
-			Id:               proto.Uint64(id),
-			Time:             proto.Int64(c.Now().Unix()),
-			Body:             []byte(draft.body),
-			BodyEncoding:     pond.Message_RAW.Enum(),
-			InReplyTo:        inReplyTo,
-			MyNextDh:         myNextDH,
-			Files:            draft.attachments,
-			DetachedFiles:    draft.detachments,
-			SupportedVersion: proto.Int32(protoVersion),
-		})
+		id, _, err := c.sendDraft(draft)
 		if err != nil {
-			c.log.Errorf("%s Error sending: %s\n", termErrPrefix, err)
+			c.Printf("%s Error sending: %s\n", termErrPrefix, err)
 			return
 		}
 		if draft.inReplyTo != 0 {
@@ -1035,17 +1372,20 @@ Handle:
 			c.Printf("%s Cannot show the current object\n", termWarnPrefix)
 		}
 
-	case showOutboxSummaryCommand:
-		c.showOutboxSummary()
-
 	case showIdentityCommand:
 		c.showIdentity()
 
 	case showInboxSummaryCommand:
-		c.showInboxSummary()
+		c.inboxSummary().WriteTo(c.term)
+
+	case showOutboxSummaryCommand:
+		c.outboxSummary().WriteTo(c.term)
 
 	case showDraftsSummaryCommand:
-		c.showDraftsSummary()
+		c.draftsSummary().WriteTo(c.term)
+
+	case showContactsCommand:
+		c.contactsSummary().WriteTo(c.term)
 
 	case showQueueStateCommand:
 		c.showQueueState()
@@ -1064,7 +1404,7 @@ Handle:
 			return
 		}
 		if size > 0 {
-			c.Printf("%s File is too large (%d bytes) to attach. Use the 'upload' or 'save-encrypted' commands to encrypt the file, include just the keys in the message and either upload or save the ciphertext\n", termErrPrefix, size)
+			c.Printf("%s File is too large (%d bytes) to attach. Use the 'upload' command to encrypt the file and upload it to your home server. Pond will include the key in the current draft.\n", termErrPrefix, size)
 			return
 		}
 
@@ -1105,10 +1445,41 @@ Handle:
 		}
 		id := c.randId()
 
+		if msg.message.DetachedFiles[i].Url == nil {
+			c.Printf("%s That detachment is just a key; you need to obtain the encrypted payload out-of-band. Use the save-key command and the decrypt utility the decrypt the payload.\n", termErrPrefix)
+			return
+		}
+
 		c.Printf("%s Downloading and decrypting detachment (Ctrl-C to abort):\n", termPrefix)
 		cancelThunk := c.startDownload(id, cmd.Filename, msg.message.DetachedFiles[i])
 
 		c.runBackgroundProcess(id, cancelThunk)
+
+	case saveKeyCommand:
+		msg, ok := c.currentObj.(*InboxMessage)
+		if !ok {
+			c.Printf("%s Select inbox message\n", termWarnPrefix)
+			return
+		}
+		i, ok := c.prepareSubobjectCommand(cmd.Number, len(msg.message.DetachedFiles), "detachment")
+		if !ok {
+			return
+		}
+
+		if msg.message.DetachedFiles[i].Url != nil {
+			c.Printf("%s (Note that this detachment can be downloaded with the 'download' command)\n", termInfoPrefix)
+		}
+
+		bytes, err := proto.Marshal(msg.message.DetachedFiles[i])
+		if err != nil {
+			panic(err)
+		}
+
+		if err := ioutil.WriteFile(cmd.Filename, bytes, 0600); err != nil {
+			c.Printf("%s Failed to write file: %s\n", termErrPrefix, terminalEscape(err.Error(), false))
+		} else {
+			c.Printf("%s Wrote file\n", termPrefix)
+		}
 
 	case saveCommand:
 		msg, ok := c.currentObj.(*InboxMessage)
@@ -1152,15 +1523,23 @@ Handle:
 			}
 		}
 
-		c.Printf("Enter shared secret with contact, or hit enter to generate, print and use a random one\n")
-		sharedSecret, err := c.term.ReadPassword("secret: ")
-		if err != nil {
-			panic(err)
+		var sharedSecret string
+
+		for {
+			c.Printf("Enter shared secret with contact, or hit enter to generate, print and use a random one\n")
+			var err error
+			sharedSecret, err = c.term.ReadPassword("secret: ")
+			if err != nil {
+				panic(err)
+			}
+			if len(sharedSecret) == 0 || panda.IsAcceptableSecretString(sharedSecret) {
+				break
+			}
+			c.Printf("%s Checksum incorrect. Please try again.\n", termErrPrefix)
 		}
+
 		if len(sharedSecret) == 0 {
-			var secret [16]byte
-			c.randBytes(secret[:])
-			sharedSecret = fmt.Sprintf("%x", secret[:])
+			sharedSecret = panda.NewSecretString(c.rand)
 			c.Printf("%s Shared secret: %s\n", termPrefix, sharedSecret)
 		}
 
@@ -1205,41 +1584,32 @@ Handle:
 			c.Printf("%s Select contact first\n", termWarnPrefix)
 		}
 
+	case retainCommand:
+		msg, ok := c.currentObj.(*InboxMessage)
+		if !ok {
+			c.Printf("%s Select inbox message first\n", termWarnPrefix)
+			return
+		}
+		msg.retained = true
+		c.save()
+
+	case dontRetainCommand:
+		msg, ok := c.currentObj.(*InboxMessage)
+		if !ok {
+			c.Printf("%s Select inbox message first\n", termWarnPrefix)
+			return
+		}
+		msg.retained = false
+		msg.exposureTime = c.Now()
+		// TODO: the CLI needs to expire messages when open as the GUI
+		// does. See guiClient.processTimer.
+		c.save()
+
 	default:
 		panic(fmt.Sprintf("Unhandled command: %#v", cmd))
 	}
 
 	return
-}
-
-// indentForReply returns a copy of in where the beginning of each line is
-// prefixed with "> ", as is typical for replies.
-func indentForReply(i []byte) string {
-	in := bufio.NewReader(bytes.NewBuffer(i))
-	var out bytes.Buffer
-
-	newLine := true
-	for {
-		line, isPrefix, err := in.ReadLine()
-		if err != nil {
-			break
-		}
-
-		if newLine {
-			if len(line) > 0 {
-				out.WriteString("> ")
-			} else {
-				out.WriteString(">")
-			}
-		}
-		out.Write(line)
-		newLine = !isPrefix
-		if !isPrefix {
-			out.WriteString("\n")
-		}
-	}
-
-	return string(out.Bytes())
 }
 
 func (c *cliClient) compose(to *Contact, draft *Draft, inReplyTo *InboxMessage) {
@@ -1292,7 +1662,7 @@ func (c *cliClient) compose(to *Contact, draft *Draft, inReplyTo *InboxMessage) 
 	// The editor is forced to vim because I'm not sure about leaks from
 	// other editors. (I'm not sure about leaks from vim either, but at
 	// least I can set some arguments to remove the obvious ones.)
-	cmd := exec.Command("vim", "-n", "-c", "set viminfo=", "+4", "--", tempFileName)
+	cmd := exec.Command("vim", "-n", "--cmd", "set modelines=0", "-c", "set viminfo=", "+4", "--", tempFileName)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1335,25 +1705,35 @@ func (c *cliClient) showInbox(msg *InboxMessage) {
 		fromString = contact.name
 	}
 
-	c.Printf("%s From: %s\n", termHeaderPrefix, terminalEscape(fromString, false))
-	c.Printf("%s Sent: %s\n", termHeaderPrefix, sentTimeText)
-	c.Printf("%s Erase: %s\n", termHeaderPrefix, eraseTimeText)
-	c.Printf("%s Retain: %t\n\n", termHeaderPrefix, msg.retained)
-	if len(msg.message.Files) > 0 {
-		c.Printf("%s Attachments (use 'save <#> <filename>' to save):\n", termHeaderPrefix)
+	table := cliTable{
+		noIndicators:      true,
+		noTrailingNewline: true,
+		rows: []cliRow{
+			cliRow{cols: []string{"From", terminalEscape(fromString, false)}},
+			cliRow{cols: []string{"Sent", sentTimeText}},
+			cliRow{cols: []string{"Erase", eraseTimeText}},
+			cliRow{cols: []string{"Retain", fmt.Sprintf("%t", msg.retained)}},
+		},
 	}
-	for i, attachment := range msg.message.Files {
-		c.Printf("%s     %d: %s (%d bytes):\n", termHeaderPrefix, i+1, terminalEscape(attachment.GetFilename(), false), len(attachment.Contents))
-	}
-	if len(msg.message.DetachedFiles) > 0 {
-		c.Printf("%s Detachments (use '[download|save-key] <#> <filename>' to save):\n", termHeaderPrefix)
-	}
-	for i, detachment := range msg.message.DetachedFiles {
-		disposition := ""
-		if detachment.Url != nil {
-			disposition = ", downloadable"
+	table.WriteTo(c.term)
+
+	if msg.message != nil {
+		if len(msg.message.Files) > 0 {
+			c.Printf("%s Attachments (use 'save <#> <filename>' to save):\n", termHeaderPrefix)
 		}
-		c.Printf("%s     %d: %s (%d bytes%s):\n", termHeaderPrefix, i+1, terminalEscape(detachment.GetFilename(), false), detachment.GetSize(), disposition)
+		for i, attachment := range msg.message.Files {
+			c.Printf("%s     %d: %s (%d bytes):\n", termHeaderPrefix, i+1, terminalEscape(attachment.GetFilename(), false), len(attachment.Contents))
+		}
+		if len(msg.message.DetachedFiles) > 0 {
+			c.Printf("%s Detachments (use '[download|save-key] <#> <filename>' to save):\n", termHeaderPrefix)
+		}
+		for i, detachment := range msg.message.DetachedFiles {
+			disposition := ""
+			if detachment.Url != nil {
+				disposition = ", downloadable"
+			}
+			c.Printf("%s     %d: %s (%d bytes%s):\n", termHeaderPrefix, i+1, terminalEscape(detachment.GetFilename(), false), detachment.GetSize(), disposition)
+		}
 	}
 	c.Printf("\n")
 	c.term.Write([]byte(terminalEscape(string(msgText), true /* line breaks ok */)))
@@ -1370,19 +1750,44 @@ func (c *cliClient) showOutbox(msg *queuedMessage) {
 	}
 	eraseTime := formatTime(msg.created.Add(messageLifetime))
 
-	c.Printf("%s To: %s\n", termHeaderPrefix, terminalEscape(contact.name, false))
-	c.Printf("%s Created: %s\n", termHeaderPrefix, formatTime(time.Unix(*msg.message.Time, 0)))
-	c.Printf("%s Sent: %s\n", termHeaderPrefix, sentTime)
-	c.Printf("%s Acknowledged: %s\n", termHeaderPrefix, formatTime(msg.acked))
-	c.Printf("%s Erase: %s\n\n", termHeaderPrefix, eraseTime)
-	c.Printf("\n")
+	table := cliTable{
+		noIndicators: true,
+		rows: []cliRow{
+			cliRow{cols: []string{"To", terminalEscape(contact.name, false)}},
+			cliRow{cols: []string{"Created", formatTime(time.Unix(*msg.message.Time, 0))}},
+			cliRow{cols: []string{"Sent", sentTime}},
+			cliRow{cols: []string{"Acknowledged", formatTime(msg.acked)}},
+			cliRow{cols: []string{"Erase", eraseTime}},
+		},
+	}
+	table.WriteTo(c.term)
+
+	if len(msg.message.Files) > 0 {
+		c.Printf("%s Attachments:\n", termHeaderPrefix)
+	}
+	for _, attachment := range msg.message.Files {
+		c.Printf("%s     %s (%d bytes):\n", termHeaderPrefix, terminalEscape(attachment.GetFilename(), false), len(attachment.Contents))
+	}
+	if len(msg.message.DetachedFiles) > 0 {
+		c.Printf("%s Detachments:\n", termHeaderPrefix)
+	}
+	for _, detachment := range msg.message.DetachedFiles {
+		c.Printf("%s     %s (%d bytes):\n", termHeaderPrefix, terminalEscape(detachment.GetFilename(), false), detachment.GetSize())
+	}
+	if len(msg.message.Files) > 0 || len(msg.message.DetachedFiles) > 0 {
+		c.Printf("\n")
+	}
+
 	c.term.Write([]byte(terminalEscape(string(msg.message.Body), true /* line breaks ok */)))
 	c.Printf("\n")
 }
 
 func (c *cliClient) showDraft(msg *Draft) {
-	contact := c.contacts[msg.to]
-	c.Printf("%s To: %s\n", termHeaderPrefix, terminalEscape(contact.name, false))
+	to := "(not specified)"
+	if msg.to != 0 {
+		to = c.contacts[msg.to].name
+	}
+	c.Printf("%s To: %s\n", termHeaderPrefix, terminalEscape(to, false))
 	c.Printf("%s Created: %s\n", termHeaderPrefix, formatTime(msg.created))
 	if len(msg.attachments) > 0 {
 		c.Printf("%s Attachments (use 'remove <#>' to remove):\n", termHeaderPrefix)
@@ -1417,19 +1822,6 @@ func (c *cliClient) renameContact(contact *Contact, newName string) {
 	c.save()
 }
 
-func (c *cliClient) maybeDeleteContact(contact *Contact) {
-	if !c.deleteArmed {
-		c.Printf("%s You attempted to delete a contact (%s). Doing so removes all messages to and from that contact and revokes their ability to send you messages. To confirm, enter the delete command again.\n", termWarnPrefix, terminalEscape(contact.name, false))
-		c.deleteArmed = true
-		return
-	}
-
-	c.deleteArmed = false
-	c.deleteContact(contact)
-	c.setCurrentObject(nil)
-	c.save()
-}
-
 func (c *cliClient) showContact(contact *Contact) {
 	if len(contact.pandaResult) > 0 {
 		c.Printf("%s PANDA error: %s\n", termErrPrefix, terminalEscape(contact.pandaResult, false))
@@ -1443,12 +1835,33 @@ func (c *cliClient) showContact(contact *Contact) {
 	if contact.isPending {
 		c.Printf("%s This contact is pending\n", termWarnPrefix)
 	}
-	c.Printf("%s Name: %s\n", termHeaderPrefix, terminalEscape(contact.name, false))
-	c.Printf("%s Server: %s\n", termHeaderPrefix, terminalEscape(contact.theirServer, false))
-	c.Printf("%s Generation: %d\n", termHeaderPrefix, contact.generation)
-	c.Printf("%s Public key: %x\n", termHeaderPrefix, contact.theirPub[:])
-	c.Printf("%s Identity key: %x\n", termHeaderPrefix, contact.theirIdentityPublic[:])
-	c.Printf("%s Client version: %d\n", termHeaderPrefix, contact.supportedVersion)
+
+	table := cliTable{
+		noIndicators: true,
+		rows: []cliRow{
+			cliRow{cols: []string{"Name", terminalEscape(contact.name, false)}},
+			cliRow{cols: []string{"Server", terminalEscape(contact.theirServer, false)}},
+			cliRow{cols: []string{"Generation", fmt.Sprintf("%d", contact.generation)}},
+			cliRow{cols: []string{"Public key", fmt.Sprintf("%x", contact.theirPub[:])}},
+			cliRow{cols: []string{"Identity key", fmt.Sprintf("%x", contact.theirIdentityPublic[:])}},
+			cliRow{cols: []string{"Client version", fmt.Sprintf("%d", contact.supportedVersion)}},
+		},
+	}
+	table.WriteTo(c.term)
+
+	if len(contact.events) > 0 {
+		table = cliTable{
+			noIndicators: true,
+			heading:      "Events for this contact",
+		}
+		for _, event := range contact.events {
+			table.rows = append(table.rows,
+				cliRow{cols: []string{event.t.Format(logTimeFormat), terminalEscape(event.msg, false)}},
+			)
+		}
+
+		table.WriteTo(c.term)
+	}
 }
 
 func NewCLIClient(stateFilename string, rand io.Reader, testing, autoFetch bool) *cliClient {

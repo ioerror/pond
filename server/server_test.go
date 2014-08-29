@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
+	math_rand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,8 +18,10 @@ import (
 	"time"
 
 	"code.google.com/p/go.crypto/curve25519"
+	"code.google.com/p/go.crypto/salsa20"
 
 	"code.google.com/p/goprotobuf/proto"
+	"github.com/agl/ed25519"
 	"github.com/agl/pond/bbssig"
 	pond "github.com/agl/pond/protos"
 	"github.com/agl/pond/transport"
@@ -96,7 +101,7 @@ func NewTestServer(setup func(dir string)) *TestServer {
 		listener: listener,
 		addr:     listener.Addr().(*net.TCPAddr),
 		dir:      dir,
-		server:   NewServer(dir),
+		server:   NewServer(dir, true),
 	}
 	io.ReadFull(rand.Reader, testServer.identity[:])
 	curve25519.ScalarBaseMult(&testServer.identityPublic, &testServer.identity)
@@ -120,12 +125,16 @@ type action struct {
 	validate        func(*testing.T, *pond.Reply)
 	payloadSize     int
 	validatePayload func(*testing.T, []byte)
+	// noAck can be set to suppress reading the ACK byte from the server,
+	// e.g. when simulating a truncated upload.
+	noAck bool
 }
 
 type scriptState struct {
 	identities       [][32]byte
 	publicIdentities [][32]byte
 	groupPrivateKeys []*bbssig.PrivateKey
+	hmacKeys         [][32]byte
 	testServer       *TestServer
 }
 
@@ -144,10 +153,60 @@ func (s *scriptState) buildDelivery(to int, message []byte, generation uint32) *
 	}
 	return &pond.Request{
 		Deliver: &pond.Delivery{
-			To:         s.publicIdentities[to][:],
-			Signature:  sig,
-			Generation: proto.Uint32(generation),
-			Message:    message,
+			To:             s.publicIdentities[to][:],
+			GroupSignature: sig,
+			Generation:     proto.Uint32(generation),
+			Message:        message,
+		},
+	}
+}
+
+type salsaRNG struct {
+	seed int
+}
+
+func (rng salsaRNG) Read(buf []byte) (n int, err error) {
+	for i := range buf {
+		buf[i] = 0
+	}
+
+	var nonce [8]byte
+	var key [32]byte
+	binary.LittleEndian.PutUint32(key[:], uint32(rng.seed))
+	rng.seed++
+	salsa20.XORKeyStream(buf, buf, nonce[:], &key)
+
+	return len(buf), nil
+}
+
+func (s *scriptState) makeOneTimePubKey(to int, seed int) (pub *[ed25519.PublicKeySize]byte, priv *[ed25519.PrivateKeySize]byte, digest uint64) {
+	rng := rand.Reader
+	if seed >= 0 {
+		rng = &salsaRNG{seed}
+	}
+	pub, priv, err := ed25519.GenerateKey(rng)
+	if err != nil {
+		panic("ed25519 Generate Key failed: " + err.Error())
+	}
+
+	h := hmac.New(sha256.New, s.hmacKeys[to][:])
+	h.Write(pub[:])
+	digestFull := h.Sum(nil)
+	digest = binary.LittleEndian.Uint64(digestFull) & hmacValueMask
+	return
+}
+
+func (s *scriptState) buildHMACDelivery(to int, message []byte, seed int) *pond.Request {
+	pub, priv, digest := s.makeOneTimePubKey(to, seed)
+	sig := ed25519.Sign(priv, message)
+
+	return &pond.Request{
+		Deliver: &pond.Delivery{
+			To:               s.publicIdentities[to][:],
+			Message:          message,
+			OneTimePublicKey: pub[:],
+			HmacOfPublicKey:  proto.Uint64(digest),
+			OneTimeSignature: sig[:],
 		},
 	}
 }
@@ -164,18 +223,21 @@ func runScript(t *testing.T, s script) {
 	}
 
 	groupPrivateKeys := make([]*bbssig.PrivateKey, s.numPlayersWithAccounts)
+	hmacKeys := make([][32]byte, s.numPlayersWithAccounts)
 	for i := range groupPrivateKeys {
 		var err error
 		groupPrivateKeys[i], err = bbssig.GenerateGroup(rand.Reader)
 		if err != nil {
 			panic(err)
 		}
+		rand.Reader.Read(hmacKeys[i][:])
 
 		conn := server.Dial(&identities[i], &publicIdentities[i])
 		if err := conn.WriteProto(&pond.Request{
 			NewAccount: &pond.NewAccount{
 				Generation: proto.Uint32(0),
 				Group:      groupPrivateKeys[i].Group.Marshal(),
+				HmacKey:    hmacKeys[i][:],
 			},
 		}); err != nil {
 			t.Fatal(err)
@@ -195,6 +257,7 @@ func runScript(t *testing.T, s script) {
 		identities:       identities,
 		publicIdentities: publicIdentities,
 		groupPrivateKeys: groupPrivateKeys,
+		hmacKeys:         hmacKeys,
 		testServer:       server,
 	}
 
@@ -230,6 +293,12 @@ func runScript(t *testing.T, s script) {
 			}
 			if a.validatePayload != nil {
 				a.validatePayload(t, fromServer)
+			}
+		}
+		if len(a.payload) > 0 && !a.noAck {
+			var ack [1]byte
+			if n, err := conn.Read(ack[:]); err != nil || n != 1 {
+				t.Fatalf("Failed to read ack: %d %s", n, err)
 			}
 		}
 		conn.Close()
@@ -273,10 +342,10 @@ func TestInvalidAddress(t *testing.T) {
 
 	oneShotTest(t, &pond.Request{
 		Deliver: &pond.Delivery{
-			To:         make([]byte, 5),
-			Signature:  make([]byte, 5),
-			Generation: proto.Uint32(0),
-			Message:    make([]byte, 5),
+			To:             make([]byte, 5),
+			GroupSignature: make([]byte, 5),
+			Generation:     proto.Uint32(0),
+			Message:        make([]byte, 5),
 		},
 	}, func(t *testing.T, reply *pond.Reply) {
 		if reply.Status == nil || *reply.Status != pond.Reply_PARSE_ERROR {
@@ -290,10 +359,10 @@ func TestNoSuchAddress(t *testing.T) {
 
 	oneShotTest(t, &pond.Request{
 		Deliver: &pond.Delivery{
-			To:         make([]byte, 32),
-			Signature:  make([]byte, 5),
-			Generation: proto.Uint32(0),
-			Message:    make([]byte, 5),
+			To:             make([]byte, 32),
+			GroupSignature: make([]byte, 5),
+			Generation:     proto.Uint32(0),
+			Message:        make([]byte, 5),
 		},
 	}, func(t *testing.T, reply *pond.Reply) {
 		if reply.Status == nil || *reply.Status != pond.Reply_NO_SUCH_ADDRESS {
@@ -485,12 +554,51 @@ func TestOversizeUpload(t *testing.T) {
 				request: &pond.Request{
 					Upload: &pond.Upload{
 						Id:   proto.Uint64(1),
-						Size: proto.Int64(1 << 32),
+						Size: proto.Int64(1 << 27),
 					},
 				},
 				validate: func(t *testing.T, reply *pond.Reply) {
 					if reply.Status == nil || *reply.Status != pond.Reply_OVER_QUOTA {
 						t.Fatalf("Bad reply to upload: %s", reply)
+					}
+				},
+			},
+		},
+	})
+}
+
+func TestQuotaOverride(t *testing.T) {
+	t.Parallel()
+
+	runScript(t, script{
+		numPlayers:             1,
+		numPlayersWithAccounts: 1,
+		actions: []action{
+			{
+				player: 0,
+				buildRequest: func(s *scriptState) *pond.Request {
+					path := filepath.Join(s.testServer.dir, "accounts", fmt.Sprintf("%x", s.publicIdentities[0][:]), "quota-megabytes")
+					ioutil.WriteFile(path, []byte("200\n"), 0644)
+
+					return &pond.Request{
+						Upload: &pond.Upload{
+							Id:   proto.Uint64(1),
+							Size: proto.Int64(1 << 27),
+						},
+					}
+				},
+				validate: func(t *testing.T, reply *pond.Reply) {
+					if reply.Status != nil {
+						t.Errorf("Bad reply to upload: %s", reply)
+						return
+					}
+					if reply.Upload == nil {
+						t.Errorf("Upload reply missing: %s", reply)
+						return
+					}
+					if reply.Upload.Resume != nil {
+						t.Errorf("Upload reply contained unexpected Resume: %s", reply)
+						return
 					}
 				},
 			},
@@ -527,6 +635,13 @@ func TestResumeUpload(t *testing.T) {
 					}
 				},
 				payload: payload[:2],
+				// Warning: this is inheriently racy. We don't
+				// wait for the ack from the server (because
+				// one will never come because we don't
+				// complete the upload). However, we don't know
+				// that the server has finished processing the
+				// bytes that we did send it.
+				noAck: true,
 			},
 			{
 				player: 0,
@@ -811,4 +926,136 @@ func TestRevocation(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestDoubleDelivery(t *testing.T) {
+	t.Parallel()
+
+	message := []byte{1, 2, 3}
+
+	runScript(t, script{
+		numPlayers:             2,
+		numPlayersWithAccounts: 1,
+		actions: []action{
+			{
+				player: 1,
+				buildRequest: func(s *scriptState) *pond.Request {
+					return s.buildHMACDelivery(0, message, 0)
+				},
+				validate: func(t *testing.T, reply *pond.Reply) {
+					if reply.Status != nil {
+						t.Errorf("Bad reply to first message send: %s", reply)
+					}
+				},
+			},
+			{
+				player: 1,
+				buildRequest: func(s *scriptState) *pond.Request {
+					return s.buildHMACDelivery(0, message, 0)
+				},
+				validate: func(t *testing.T, reply *pond.Reply) {
+					if reply.Status == nil || *reply.Status != pond.Reply_HMAC_USED {
+						t.Errorf("Bad reply to duplicate message send: %s", reply)
+					}
+				},
+			},
+		},
+	})
+}
+
+func TestDeliveryAfterRevocation(t *testing.T) {
+	t.Parallel()
+
+	message := []byte{1, 2, 3}
+
+	runScript(t, script{
+		numPlayers:             2,
+		numPlayersWithAccounts: 1,
+		actions: []action{
+			{
+				player: 0,
+				buildRequest: func(s *scriptState) *pond.Request {
+					_, _, hmac := s.makeOneTimePubKey(0, 0)
+					return &pond.Request{
+						HmacStrike: &pond.HMACStrike{
+							Hmacs: []uint64{hmac | 1<<63},
+						},
+					}
+				},
+			},
+			{
+				player: 1,
+				buildRequest: func(s *scriptState) *pond.Request {
+					return s.buildHMACDelivery(0, message, 0)
+				},
+				validate: func(t *testing.T, reply *pond.Reply) {
+					if reply.Status == nil || *reply.Status != pond.Reply_HMAC_REVOKED {
+						t.Errorf("Bad reply to duplicate message send: %s", reply)
+					}
+				},
+			},
+		},
+	})
+}
+
+func TestHMACInsertion(t *testing.T) {
+	dir, err := ioutil.TempDir("", "hmactest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "hmacstrike")
+	values := math_rand.Perm(1024)
+
+	for i, v := range values {
+		v64 := uint64(v)
+		if i%2 == 0 {
+			v64 |= 1 << 63
+		}
+		result, ok := insertHMAC(path, v64)
+		if !ok {
+			t.Fatal("insert failed")
+		}
+		if result != hmacFresh {
+			t.Fatal("fresh value not recognised as such")
+		}
+	}
+
+	for i, v := range values {
+		result, ok := insertHMAC(path, uint64(v))
+		if !ok {
+			t.Fatal("insert failed")
+		}
+		expected := hmacUsed
+		if i%2 == 0 {
+			expected = hmacRevoked
+		}
+		if result != expected {
+			t.Fatal("value double inserted")
+		}
+	}
+
+	values = math_rand.Perm(2048)
+	var valueBatch [16]uint64
+	for i := 0; i < len(values); i += 16 {
+		for i, v := range values[i : i+16] {
+			valueBatch[i] = uint64(v)
+			if i%2 == 1 {
+				valueBatch[i] |= 1 << 63
+			}
+		}
+		if !insertHMACs(path, valueBatch[:]) {
+			t.Fatal("inserts failed")
+		}
+	}
+
+	for _, v := range values {
+		result, ok := insertHMAC(path, uint64(v))
+		if !ok {
+			t.Fatal("insert failed")
+		}
+		if result == hmacFresh {
+			t.Fatalf("value double inserted")
+		}
+	}
 }

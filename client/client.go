@@ -59,21 +59,26 @@ package main
 // the tests can fully synchonise and avoid non-determinism.
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"code.google.com/p/go.crypto/curve25519"
+	"code.google.com/p/go.crypto/nacl/secretbox"
 	"code.google.com/p/goprotobuf/proto"
 	"github.com/agl/ed25519"
+	"github.com/agl/ed25519/extra25519"
 	"github.com/agl/pond/bbssig"
 	"github.com/agl/pond/client/disk"
 	"github.com/agl/pond/client/ratchet"
@@ -230,7 +235,10 @@ type UI interface {
 	ShutdownAndSuspend() error
 	createPassphraseUI() (string, error)
 	createErasureStorage(pw string, stateFile *disk.StateFile) error
-	createAccountUI() error
+	// createAccountUI allows the user to either create a new account or to
+	// import from a entombed statefile. It returns whether an import
+	// occured and an error.
+	createAccountUI(stateFile *disk.StateFile, pw string) (bool, error)
 	keyPromptUI(stateFile *disk.StateFile) error
 	processFetch(msg *InboxMessage)
 	processServerAnnounce(announce *InboxMessage)
@@ -258,6 +266,9 @@ type UI interface {
 	addRevocationMessageUI(msg *queuedMessage)
 	// removeContactUI removes a contact from the UI.
 	removeContactUI(contact *Contact)
+	// logEventUI is called when an exceptional event has been logged for
+	// the given contact.
+	logEventUI(contact *Contact, event Event)
 	// mainUI starts the main interface.
 	mainUI()
 }
@@ -451,6 +462,8 @@ type Contact struct {
 	// pandaResult contains an error message in the event that a PANDA key
 	// exchange failed.
 	pandaResult string
+	// events contains a log of important events relating to this contact.
+	events []Event
 
 	// Members for the old ratchet.
 	lastDHPrivate        [32]byte
@@ -462,6 +475,14 @@ type Contact struct {
 	ratchet *ratchet.Ratchet
 
 	cliId cliId
+}
+
+// Event represents a log entry. This does not apply to the global log, which
+// is quite chatty, but rather to significant events related to a given
+// contact. These events are surfaced in the UI and recorded in the statefile.
+type Event struct {
+	t   time.Time
+	msg string
 }
 
 // previousTagLifetime contains the amount of time that we'll store a previous
@@ -509,7 +530,29 @@ type Draft struct {
 	// saved to disk.
 	cliId cliId
 
+	// pendingDetachments is only used by the GTK UI.
 	pendingDetachments map[uint64]*pendingDetachment
+}
+
+// prettyNumber formats n in base 10 and puts commas between groups of
+// thousands.
+func prettyNumber(n uint64) string {
+	s := strconv.FormatUint(n, 10)
+	ret := make([]rune, 0, len(s)*2)
+
+	phase := len(s) % 3
+	for i, r := range s {
+		if phase == 0 && i > 0 {
+			ret = append(ret, ',')
+		}
+		ret = append(ret, r)
+		phase--
+		if phase < 0 {
+			phase += 3
+		}
+	}
+
+	return string(ret)
 }
 
 // usageString returns a description of the amount of space taken up by a body
@@ -538,7 +581,7 @@ func (draft *Draft) usageString() (string, bool) {
 		panic("error while serialising candidate Message: " + err.Error())
 	}
 
-	s := fmt.Sprintf("%d of %d bytes", len(serialized), pond.MaxSerializedMessage)
+	s := fmt.Sprintf("%s of %s bytes", prettyNumber(uint64(len(serialized))), prettyNumber(pond.MaxSerializedMessage))
 	return s, len(serialized) > pond.MaxSerializedMessage
 }
 
@@ -609,9 +652,21 @@ func (c *client) outboxToDraft(msg *queuedMessage) *Draft {
 	return draft
 }
 
-// detectTor attempts to connect to port 9050 and 9150 on the local host and
-// assumes that Tor is running on the first port that it finds to be open.
+// detectTor sets c.torAddress, either from the POND_TOR_ADDRESS environment
+// variable if it is set or by attempting to connect to port 9050 and 9150 on
+// the local host and assuming that Tor is running on the first port that it
+// finds to be open.
 func (c *client) detectTor() bool {
+	if addr := os.Getenv("POND_TOR_ADDRESS"); len(addr) != 0 {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			c.log.Printf("Ignoring POND_TOR_ADDRESS because of parse error: %s", err)
+		} else {
+			c.torAddress = addr
+			c.log.Printf("Using POND_TOR_ADDRESS=%s", addr)
+			return true
+		}
+	}
+
 	ports := []int{9050, 9150}
 	for _, port := range ports {
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -625,6 +680,15 @@ func (c *client) detectTor() bool {
 	}
 
 	return false
+}
+
+var knownServers = []struct {
+	nickname    string
+	description string
+	uri         string
+}{
+	{"wau", "Wau Holland Foundation", "pondserver://25WHHEVD3565FGIOXJZWV7LGQFR4BTO3HF3FWHEW7PCYPFMFPVOQ@vx652n4utsodj5c6.onion"},
+	{"hoi", "Hoi Polloi (https://hoi-polloi.org)", "pondserver://4V6Q5M2AFLBW6UIYL2B5LMKDHEBA6HRHR6UIUU3VDQFNI3BHZAEQ@oum7argqrnlzpcro.onion"},
 }
 
 func (c *client) enqueue(m *queuedMessage) {
@@ -672,7 +736,7 @@ func (c *client) loadUI() error {
 		},
 	}
 
-	var newAccount bool
+	var newAccount, imported bool
 	var err error
 	if c.stateLock, err = stateFile.Lock(false /* don't create */); err == nil && c.stateLock == nil {
 		c.ui.errorUI("State file locked by another process. Waiting for lock.", false)
@@ -707,7 +771,7 @@ func (c *client) loadUI() error {
 		if c.disableV2Ratchet {
 			c.randBytes(c.identity[:])
 		} else {
-			ed25519.PrivateKeyToCurve25519(&c.identity, priv)
+			extra25519.PrivateKeyToCurve25519(&c.identity, priv)
 		}
 		curve25519.ScalarBaseMult(&c.identityPublic, &c.identity)
 
@@ -720,10 +784,10 @@ func (c *client) loadUI() error {
 			return err
 		}
 		c.ui.createErasureStorage(pw, stateFile)
-		if err := c.ui.createAccountUI(); err != nil {
+		imported, err = c.ui.createAccountUI(stateFile, pw)
+		if err != nil {
 			return err
 		}
-		newAccount = true
 	} else {
 		// First try with zero key.
 		err := c.loadState(stateFile, "")
@@ -743,7 +807,7 @@ func (c *client) loadUI() error {
 		}
 	}
 
-	if newAccount {
+	if newAccount && !imported {
 		c.stateLock, err = stateFile.Lock(true /* create */)
 		if err != nil {
 			err = errors.New("Failed to create state file: " + err.Error())
@@ -870,7 +934,7 @@ func (contact *Contact) processKeyExchange(kxsBytes []byte, testing, simulateOld
 		// isomorphism) then the contact is using the v2 ratchet.
 		var ed25519Public, curve25519Public [32]byte
 		copy(ed25519Public[:], kx.PublicKey)
-		ed25519.PublicKeyToCurve25519(&curve25519Public, &ed25519Public)
+		extra25519.PublicKeyToCurve25519(&curve25519Public, &ed25519Public)
 		v2 := !disableV2Ratchet && bytes.Equal(curve25519Public[:], kx.IdentityPublic[:])
 		if err := contact.ratchet.CompleteKeyExchange(&kx, v2); err != nil {
 			return err
@@ -880,6 +944,17 @@ func (contact *Contact) processKeyExchange(kxsBytes []byte, testing, simulateOld
 	contact.generation = *kx.Generation
 
 	return nil
+}
+
+// logEvent records an exceptional event relating to the given contact.
+func (c *client) logEvent(contact *Contact, msg string) {
+	event := Event{
+		t:   time.Now(),
+		msg: msg,
+	}
+	contact.events = append(contact.events, event)
+	c.log.Errorf("While processing message from %s: %s", contact.name, msg)
+	c.ui.logEventUI(contact, event)
 }
 
 func (c *client) randBytes(buf []byte) {
@@ -980,6 +1055,21 @@ func (c *client) deleteInboxMsg(id uint64) {
 	c.inbox = newInbox
 }
 
+// dropSealedAndAckMessagesFrom removes all sealed or pure-ack messages from
+// the given contact, from the inbox.
+func (c *client) dropSealedAndAckMessagesFrom(contact *Contact) {
+	newInbox := make([]*InboxMessage, 0, len(c.inbox))
+	for _, inboxMsg := range c.inbox {
+		if inboxMsg.from == contact.id &&
+			(len(inboxMsg.sealed) > 0 ||
+				(inboxMsg.message != nil && len(inboxMsg.message.Body) == 0)) {
+			continue
+		}
+		newInbox = append(newInbox, inboxMsg)
+	}
+	c.inbox = newInbox
+}
+
 func (c *client) deleteOutboxMsg(id uint64) {
 	newOutbox := make([]*queuedMessage, 0, len(c.outbox))
 	for _, outboxMsg := range c.outbox {
@@ -1064,6 +1154,36 @@ func (c *client) deleteContact(contact *Contact) {
 	delete(c.contacts, contact.id)
 }
 
+// indentForReply returns a copy of in where the beginning of each line is
+// prefixed with "> ", as is typical for replies.
+func indentForReply(i []byte) string {
+	in := bufio.NewReader(bytes.NewBuffer(i))
+	var out bytes.Buffer
+
+	newLine := true
+	for {
+		line, isPrefix, err := in.ReadLine()
+		if err != nil {
+			break
+		}
+
+		if newLine {
+			if len(line) > 0 {
+				out.WriteString("> ")
+			} else {
+				out.WriteString(">")
+			}
+		}
+		out.Write(line)
+		newLine = !isPrefix
+		if !isPrefix {
+			out.WriteString("\n")
+		}
+	}
+
+	return string(out.Bytes())
+}
+
 // RunPANDA runs in its own goroutine and runs a PANDA key exchange.
 func (c *client) runPANDA(serialisedKeyExchange []byte, id uint64, name string, shutdown chan struct{}) {
 	var result []byte
@@ -1120,7 +1240,6 @@ func (c *client) processPANDAUpdate(update pandaUpdate) {
 	case update.result != nil:
 		contact.pandaKeyExchange = nil
 		contact.pandaShutdownChan = nil
-		contact.isPending = false
 
 		if err := contact.processKeyExchange(update.result, c.dev, c.simulateOldClient, c.disableV2Ratchet); err != nil {
 			contact.pandaResult = err.Error()
@@ -1128,6 +1247,7 @@ func (c *client) processPANDAUpdate(update pandaUpdate) {
 			c.log.Printf("Key exchange with %s failed: %s", contact.name, err)
 		} else {
 			c.log.Printf("Key exchange with %s complete", contact.name)
+			contact.isPending = false
 		}
 	}
 
@@ -1160,4 +1280,110 @@ func openAttachment(path string) (contents []byte, size int64, err error) {
 		size = fi.Size()
 	}
 	return
+}
+
+// entomb encrypts and *destroys* the statefile. The encrypted statefile is
+// written to tombFile (with tombPath). The function log will be called during
+// the process to give status updates. It returns the random key of the
+// encrypted statefile and whether the process was successful. If unsuccessful,
+// the original statefile will not be destroyed.
+func (c *client) entomb(tombPath string, tombFile *os.File, log func(string, ...interface{})) (keyHex *[32]byte, ok bool) {
+	log("Emtombing statefile to %s\n", tombPath)
+	log("Stopping network processing...\n")
+	if c.fetchNowChan != nil {
+		close(c.fetchNowChan)
+	}
+	log("Stopping active key exchanges...\n")
+	for _, contact := range c.contacts {
+		if contact.pandaShutdownChan != nil {
+			close(contact.pandaShutdownChan)
+		}
+	}
+	log("Serialising state...\n")
+	stateBytes := c.marshal()
+
+	var key [32]byte
+	c.randBytes(key[:])
+	var nonce [24]byte
+	log("Encrypting...\n")
+	encrypted := secretbox.Seal(nil, stateBytes, &nonce, &key)
+
+	log("Writing...\n")
+	if _, err := tombFile.Write(encrypted); err != nil {
+		log("Error writing: %s\n", err)
+		return nil, false
+	}
+	log("Syncing...\n")
+	if err := tombFile.Sync(); err != nil {
+		log("Error syncing: %s\n", err)
+		return nil, false
+	}
+	if err := tombFile.Close(); err != nil {
+		log("Error closing: %s\n", err)
+		return nil, false
+	}
+
+	readBack, err := ioutil.ReadFile(tombPath)
+	if err != nil {
+		log("Error rereading: %s\n", err)
+		return nil, false
+	}
+	if !bytes.Equal(readBack, encrypted) {
+		log("Contents of tomb file incorrect\n")
+		return nil, false
+	}
+
+	log("The ephemeral key is: %x\n", key)
+	log("You must write the ephemeral key down now! Store it somewhat erasable!\n")
+
+	log("Erasing statefile... ")
+	c.writerChan <- disk.NewState{stateBytes, false, true /* destruct */}
+	<-c.writerDone
+	log("done\n")
+
+	return &key, true
+}
+
+// importTombFile decrypts a file with the given path, using a hex-encoded key
+// and loads the client state from the result.
+func (c *client) importTombFile(stateFile *disk.StateFile, keyHex, path string) error {
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return err
+	}
+
+	var key [32]byte
+	var nonce [24]byte
+	if len(keyBytes) != len(key) {
+		return fmt.Errorf("Incorrect key length: %d (want %d)", len(keyBytes), len(key))
+	}
+	copy(key[:], keyBytes)
+
+	tombBytes, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	plaintext, ok := secretbox.Open(nil, tombBytes, &nonce, &key)
+	if !ok {
+		return errors.New("Incorrect key")
+	}
+
+	c.stateLock, err = stateFile.Lock(true /* create */)
+	if c.stateLock == nil && err == nil {
+		return errors.New("Output statefile is locked.")
+	}
+	if err != nil {
+		return err
+	}
+
+	writerChan := make(chan disk.NewState)
+	writerDone := make(chan struct{})
+	go stateFile.StartWriter(writerChan, writerDone)
+
+	writerChan <- disk.NewState{State: plaintext}
+	close(writerChan)
+	<-writerDone
+
+	return nil
 }

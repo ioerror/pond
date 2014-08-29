@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"code.google.com/p/go.crypto/curve25519"
 	"code.google.com/p/goprotobuf/proto"
 	"github.com/agl/pond/client/disk"
 	"github.com/agl/pond/panda"
@@ -75,6 +75,8 @@ const (
 	uiStatePANDAComplete
 	uiStateErasureStorage
 	uiStateTimerComplete
+	uiStateEntomb
+	uiStateEntombComplete
 )
 
 type guiClient struct {
@@ -158,8 +160,8 @@ RestartInboxIteration:
 				// c.inbox will have been updated by this
 				// deletion so we start from the beginning
 				// again.
-				continue RestartInboxIteration
 				haveDeleted = true
+				continue RestartInboxIteration
 			}
 			c.updateInboxBackgroundColor(msg)
 		}
@@ -817,43 +819,43 @@ func (c *guiClient) keyPromptUI(stateFile *disk.StateFile) error {
 }
 
 func (c *guiClient) createPassphraseUI() (string, error) {
-	ui := VBox{
-		widgetBase: widgetBase{padding: 40, expand: true, fill: true, name: "vbox"},
-		children: []Widget{
-			Label{
-				widgetBase: widgetBase{font: "DejaVu Sans 30"},
-				text:       "Set Passphrase",
+	ui := Grid{
+		widgetBase: widgetBase{margin: 20},
+		rowSpacing: 5,
+		colSpacing: 5,
+		rows: [][]GridE{
+			{
+				{2, 1, Label{
+					widgetBase: widgetBase{font: "DejaVu Sans 30"},
+					text:       "Set Passphrase",
+				}},
 			},
-			Label{
-				widgetBase: widgetBase{
-					padding: 20,
-					font:    "DejaVu Sans 14",
-				},
-				text: msgCreatePassphrase,
-				wrap: 600,
+			{
+				{2, 1, Label{
+					widgetBase: widgetBase{
+						padding: 20,
+						font:    "DejaVu Sans 14",
+					},
+					text: msgCreatePassphrase,
+					wrap: 600,
+				}},
 			},
-			HBox{
-				spacing: 5,
-				children: []Widget{
-					Label{
-						text:   "Passphrase:",
-						yAlign: 0.5,
-					},
-					Entry{
-						widgetBase: widgetBase{name: "pw"},
-						width:      60,
-						password:   true,
-					},
-				},
+			{
+				{1, 1, Label{
+					text:   "Passphrase:",
+					yAlign: 0.5,
+				}},
+				{1, 1, Entry{
+					widgetBase: widgetBase{name: "pw", hAlign: AlignStart, hExpand: true},
+					width:      60,
+					password:   true,
+				}},
 			},
-			HBox{
-				widgetBase: widgetBase{padding: 40},
-				children: []Widget{
-					Button{
-						widgetBase: widgetBase{name: "next"},
-						text:       "Next",
-					},
-				},
+			{
+				{2, 1, Button{
+					widgetBase: widgetBase{name: "next", hAlign: AlignStart},
+					text:       "Next",
+				}},
 			},
 		},
 	}
@@ -888,49 +890,108 @@ func (c *guiClient) createPassphraseUI() (string, error) {
 	panic("unreachable")
 }
 
-func (c *guiClient) createAccountUI() error {
+func (c *guiClient) createAccountUI(stateFile *disk.StateFile, pw string) (didImport bool, err error) {
 	defaultServer := msgDefaultServer
 	if c.dev {
 		defaultServer = msgDefaultDevServer
 	}
 
-	ui := VBox{
-		widgetBase: widgetBase{padding: 40, expand: true, fill: true, name: "vbox"},
-		children: []Widget{
-			Label{
-				widgetBase: widgetBase{font: "DejaVu Sans 30"},
-				text:       "Create Account",
+	serverLabels := []string{"Default"}
+	for _, server := range knownServers {
+		serverLabels = append(serverLabels, server.description)
+	}
+	serverLabels = append(serverLabels, "Custom")
+
+	ui := Grid{
+		widgetBase: widgetBase{margin: 20},
+		rowSpacing: 5,
+		colSpacing: 5,
+		rows: [][]GridE{
+			{
+				{2, 1, Label{
+					widgetBase: widgetBase{font: "DejaVu Sans 30"},
+					text:       "Create Account",
+				}},
 			},
-			Label{
-				widgetBase: widgetBase{
-					padding: 20,
-					font:    "DejaVu Sans 14",
-				},
-				text: msgCreateAccount + " If you want to use the default server, just click 'Create'.",
-				wrap: 600,
+			{
+				{2, 1, Label{
+					widgetBase: widgetBase{
+						padding: 20,
+						font:    "DejaVu Sans 14",
+					},
+					text: msgCreateAccount + " If you want to use the default server, just click 'Create'.",
+					wrap: 600,
+				}},
 			},
-			HBox{
-				spacing: 5,
-				children: []Widget{
-					Label{
-						text:   "Server:",
-						yAlign: 0.5,
-					},
-					Entry{
-						widgetBase: widgetBase{name: "server"},
-						width:      60,
-						text:       defaultServer,
-					},
-				},
+			{
+				{1, 1, Combo{
+					widgetBase:  widgetBase{name: "servercombo"},
+					labels:      serverLabels,
+					preSelected: "Default",
+				}},
+				{1, 1, Entry{
+					widgetBase: widgetBase{name: "server", hAlign: AlignStart, hExpand: true, margin: 10, insensitive: true},
+					width:      60,
+					text:       defaultServer,
+				}},
 			},
-			HBox{
-				widgetBase: widgetBase{padding: 40},
-				children: []Widget{
-					Button{
-						widgetBase: widgetBase{name: "create"},
-						text:       "Create",
+			{
+				{2, 1, Button{
+					widgetBase: widgetBase{name: "create", hAlign: AlignStart},
+					text:       "Create",
+				}},
+			},
+			{
+				{2, 1, VBox{
+					widgetBase: widgetBase{name: "vbox"},
+				}},
+			},
+			{
+				{2, 1, Grid{
+					widgetBase: widgetBase{vAlign: AlignEnd, vExpand: true},
+					rowSpacing: 5,
+					colSpacing: 5,
+					rows: [][]GridE{
+						{
+							{2, 1, Label{
+								widgetBase: widgetBase{font: "bold"},
+								text:       "Import entombed state file",
+							}},
+						},
+						{
+							{2, 1, Label{
+								text: "Rather than creating a new account, it's also possible to import an 'entombed' state file. This is used when moving Pond from one computer to another.",
+								wrap: 600,
+							}},
+						},
+						{
+							{1, 1, Label{
+								text:   "Key:",
+								yAlign: 0.5,
+							}},
+							{1, 1, Entry{
+								widgetBase: widgetBase{name: "tombkey", hAlign: AlignStart, hExpand: true},
+								width:      66,
+							}},
+						},
+						{
+							{1, 1, Button{
+								widgetBase: widgetBase{name: "tombfile", hAlign: AlignStart},
+								text:       "Select File",
+							}},
+							{1, 1, Button{
+								widgetBase: widgetBase{name: "import", hAlign: AlignStart, insensitive: true},
+								text:       "Import",
+							}},
+						},
+						{
+							{2, 1, Label{
+								widgetBase: widgetBase{name: "tomberror", foreground: colorRed},
+								wrap:       600,
+							}},
+						},
 					},
-				},
+				}},
 			},
 		},
 	}
@@ -941,12 +1002,76 @@ func (c *guiClient) createAccountUI() error {
 	c.gui.Signal()
 
 	var spinnerCreated bool
+	var tombPath string
 	for {
-		click, ok := <-c.gui.Events()
+		event, ok := <-c.gui.Events()
 		if !ok {
 			c.ShutdownAndSuspend()
 		}
-		c.server = click.(Click).entries["server"]
+
+		if open, ok := event.(OpenResult); ok && open.ok {
+			tombPath = open.path
+			c.gui.Actions() <- Sensitive{name: "import", sensitive: true}
+			c.gui.Signal()
+			continue
+		}
+
+		click, ok := event.(Click)
+		if !ok {
+			continue
+		}
+
+		switch click.name {
+		case "tombfile":
+			c.gui.Actions() <- FileOpen{
+				save:     false,
+				title:    "Select path of entombed file",
+				filename: "statefile.tomb",
+				arg:      nil,
+			}
+			c.gui.Signal()
+			continue
+		case "import":
+			if err := c.importTombFile(stateFile, click.entries["tombkey"], tombPath); err == nil {
+				err = c.loadState(stateFile, pw)
+			}
+			if err != nil {
+				c.gui.Actions() <- SetText{name: "tomberror", text: err.Error()}
+				c.gui.Actions() <- UIError{err}
+				c.gui.Signal()
+				continue
+			}
+
+			c.lastErasureStorageTime = time.Now()
+			return true, nil
+		case "servercombo":
+			selected := click.combos["servercombo"]
+			server := ""
+
+			switch selected {
+			case "Default":
+				server = defaultServer
+			case "Custom":
+				server = ""
+			default:
+				for _, known := range knownServers {
+					if known.description == selected {
+						server = known.uri
+					}
+				}
+			}
+
+			c.gui.Actions() <- Sensitive{name: "server", sensitive: len(server) == 0}
+			c.gui.Actions() <- SetEntry{name: "server", text: server}
+			c.gui.Signal()
+			continue
+		case "create":
+			break
+		default:
+			continue
+		}
+
+		c.server = click.entries["server"]
 
 		c.gui.Actions() <- Sensitive{name: "server", sensitive: false}
 		c.gui.Actions() <- Sensitive{name: "create", sensitive: false}
@@ -954,20 +1079,18 @@ func (c *guiClient) createAccountUI() error {
 		const initialMessage = "Checking..."
 
 		if !spinnerCreated {
-			c.gui.Actions() <- Append{
+			c.gui.Actions() <- SetBoxContents{
 				name: "vbox",
-				children: []Widget{
-					HBox{
-						widgetBase: widgetBase{name: "statusbox"},
-						spacing:    10,
-						children: []Widget{
-							Spinner{
-								widgetBase: widgetBase{name: "spinner"},
-							},
-							Label{
-								widgetBase: widgetBase{name: "status"},
-								text:       initialMessage,
-							},
+				child: HBox{
+					widgetBase: widgetBase{name: "statusbox"},
+					spacing:    10,
+					children: []Widget{
+						Spinner{
+							widgetBase: widgetBase{name: "spinner"},
+						},
+						Label{
+							widgetBase: widgetBase{name: "status"},
+							text:       initialMessage,
 						},
 					},
 				},
@@ -997,7 +1120,7 @@ func (c *guiClient) createAccountUI() error {
 		break
 	}
 
-	return nil
+	return false, nil
 }
 
 func (c *guiClient) ShutdownAndSuspend() error {
@@ -1779,7 +1902,7 @@ func nameValuesLHS(entries []nvEntry) Widget {
 }
 
 func (c *guiClient) identityUI() interface{} {
-	left := nameValuesLHS([]nvEntry{
+	entries := nameValuesLHS([]nvEntry{
 		{"SERVER", c.server},
 		{"PUBLIC IDENTITY", fmt.Sprintf("%x", c.identityPublic[:])},
 		{"PUBLIC KEY", fmt.Sprintf("%x", c.pub[:])},
@@ -1787,11 +1910,149 @@ func (c *guiClient) identityUI() interface{} {
 		{"GROUP GENERATION", fmt.Sprintf("%d", c.generation)},
 	})
 
+	left := Grid{
+		widgetBase: widgetBase{margin: 6},
+		rowSpacing: 10,
+		colSpacing: 3,
+		rows: [][]GridE{
+			{
+				{1, 1, entries},
+			},
+			{
+				{1, 1, Grid{
+					widgetBase: widgetBase{margin: 6},
+					rowSpacing: 3,
+					colSpacing: 3,
+					rows: [][]GridE{
+						{
+							{3, 1, Label{
+								widgetBase: widgetBase{
+									font: "bold",
+								},
+								text: "Entombing",
+							}},
+						},
+						{
+							{3, 1, Label{
+								text: "Entombing your statefile causes it to be converted into an encrypted file that can be moved to a different computer. The file is encrypted with an ephemeral key that is printed at the end of the entombing process and must be written down. The original statefile is erased. Once the entombed file has been imported elsewhere, the paper with the ephemeral key must be destroyed.",
+								wrap: 600,
+							}},
+						},
+						{
+							{1, 1, Button{
+								widgetBase: widgetBase{name: "tombfile"},
+								text:       "Select file",
+							}},
+							{1, 1, Button{
+								widgetBase: widgetBase{
+									name:        "entomb",
+									insensitive: true,
+								},
+								text: "Entomb",
+							}},
+							{1, 1, Label{
+								widgetBase: widgetBase{hExpand: true},
+							}},
+						},
+						{
+							{3, 1, Label{
+								widgetBase: widgetBase{
+									name:       "tomberror",
+									foreground: colorRed,
+								},
+							}},
+						},
+					},
+				}},
+			},
+		},
+	}
+
 	c.gui.Actions() <- SetChild{name: "right", child: rightPane("IDENTITY", left, nil, nil)}
 	c.gui.Actions() <- UIState{uiStateShowIdentity}
 	c.gui.Signal()
 
-	return nil
+	var tombPath string
+
+	for {
+		event, wanted := c.nextEvent(0)
+		if wanted {
+			return event
+		}
+
+		if open, ok := event.(OpenResult); ok && open.ok {
+			tombPath = open.path
+			c.gui.Actions() <- Sensitive{name: "entomb", sensitive: true}
+			c.gui.Signal()
+			continue
+		}
+
+		click, ok := event.(Click)
+		if !ok {
+			continue
+		}
+
+		switch click.name {
+		case "tombfile":
+			c.gui.Actions() <- FileOpen{
+				save:     true,
+				title:    "Select path for entombed file",
+				filename: "statefile.tomb",
+				arg:      nil,
+			}
+			c.gui.Signal()
+		case "entomb":
+			f, err := os.OpenFile(tombPath, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0400)
+			if err != nil {
+				c.gui.Actions() <- SetText{
+					name: "tomberror",
+					text: err.Error(),
+				}
+				c.gui.Actions() <- UIError{err}
+				c.gui.Signal()
+				continue
+			}
+
+			c.gui.Actions() <- Reset{TextView{
+				widgetBase: widgetBase{name: "log"},
+				editable:   false,
+				wrap:       true,
+			}}
+			c.gui.Actions() <- UIState{uiStateEntomb}
+			c.gui.Signal()
+
+			var logText string
+			log := func(msg string, args ...interface{}) {
+				logText += fmt.Sprintf(msg, args...)
+				c.gui.Actions() <- SetTextView{
+					name: "log",
+					text: logText,
+				}
+				c.gui.Signal()
+			}
+
+			key, ok := c.entomb(tombPath, f, log)
+			if ok {
+				log("\nThe process has completed successfully. You must write down the ephemeral key now. You can close this window when done.\n")
+				c.gui.Actions() <- UIInfo{fmt.Sprintf("%x", key[:])}
+			} else {
+				log("\nThe process failed! Your statefile is still intact. Please close this window and restart when ready.")
+			}
+
+			c.gui.Actions() <- UIState{uiStateEntombComplete}
+			c.gui.Signal()
+
+			for {
+				if _, ok := <-c.gui.Events(); !ok {
+					break
+				}
+			}
+			close(c.gui.Actions())
+			select {}
+		}
+	}
+
+	panic("unreachable")
 }
 
 func (c *guiClient) showContact(id uint64) interface{} {
@@ -1799,6 +2060,7 @@ func (c *guiClient) showContact(id uint64) interface{} {
 	if contact.isPending && len(contact.pandaKeyExchange) == 0 && len(contact.pandaResult) == 0 {
 		return c.newContactUI(contact)
 	}
+	c.contactsUI.SetIndicator(id, indicatorNone)
 
 	entries := []nvEntry{
 		{"NAME", contact.name},
@@ -1825,6 +2087,19 @@ func (c *guiClient) showContact(id uint64) interface{} {
 		var out bytes.Buffer
 		pem.Encode(&out, &pem.Block{Bytes: contact.kxsBytes, Type: keyExchangePEM})
 		entries = append(entries, nvEntry{"KEY EXCHANGE", string(out.Bytes())})
+	}
+
+	if len(contact.events) > 0 {
+		eventsText := ""
+		for i, event := range contact.events {
+			if i > 0 {
+				eventsText += "\n"
+			}
+			eventsText += event.t.Format(logTimeFormat)
+			eventsText += ": "
+			eventsText += event.msg
+		}
+		entries = append(entries, nvEntry{"EVENTS", eventsText})
 	}
 
 	right := Grid{
@@ -2226,7 +2501,7 @@ func (c *guiClient) newContactPanda(contact *Contact, existing bool, nextRow int
 					colSpacing: 5,
 					rows: [][]GridE{
 						{
-							{1, 1, Entry{widgetBase: widgetBase{name: "shared", width: 400}}},
+							{1, 1, Entry{widgetBase: widgetBase{name: "shared", width: 400}, updateOnChange: true}},
 							{1, 1, Button{widgetBase: widgetBase{name: "generate"}, text: "Generate"}},
 						},
 					},
@@ -2338,6 +2613,12 @@ SharedSecretEvent:
 			return event
 		}
 
+		if update, ok := event.(Update); ok && update.name == "shared" {
+			ok := panda.IsAcceptableSecretString(update.text)
+			c.gui.Actions() <- Sensitive{name: "begin", sensitive: ok}
+			c.gui.Signal()
+		}
+
 		if update, ok := event.(Update); ok && update.name == "cardentry" && len(update.text) >= 2 {
 			cardText := update.text[:2]
 			if cardText == "10" {
@@ -2441,9 +2722,7 @@ SharedSecretEvent:
 				contact.kxsBytes = nil
 				break SharedSecretEvent
 			case click.name == "generate":
-				var secret [16]byte
-				c.randBytes(secret[:])
-				c.gui.Actions() <- SetEntry{name: "shared", text: fmt.Sprintf("%x", secret[:])}
+				c.gui.Actions() <- SetEntry{name: "shared", text: panda.NewSecretString(c.rand)}
 				c.gui.Signal()
 			}
 		}
@@ -2657,22 +2936,19 @@ func (c *guiClient) composeUI(draft *Draft, inReplyTo *InboxMessage) interface{}
 	}
 
 	if draft == nil {
-		var replyToId, contactId uint64
 		from := preSelected
-
-		if inReplyTo != nil {
-			replyToId = inReplyTo.id
-			contactId = inReplyTo.from
-		}
 		if len(preSelected) == 0 {
 			from = "Unknown"
 		}
 
 		draft = &Draft{
-			id:        c.randId(),
-			inReplyTo: replyToId,
-			to:        contactId,
-			created:   c.Now(),
+			id:      c.randId(),
+			created: c.Now(),
+		}
+		if inReplyTo != nil {
+			draft.inReplyTo = inReplyTo.id
+			draft.to = inReplyTo.from
+			draft.body = indentForReply(inReplyTo.message.GetBody())
 		}
 
 		c.draftsUI.Add(draft.id, from, draft.created.Format(shortTimeFormat), indicatorNone)
@@ -3046,52 +3322,26 @@ func (c *guiClient) composeUI(draft *Draft, inReplyTo *InboxMessage) interface{}
 		if len(toName) == 0 {
 			continue
 		}
-
-		var to *Contact
 		for _, contact := range c.contacts {
 			if contact.name == toName {
-				to = contact
+				draft.to = contact.id
 				break
 			}
 		}
 
-		var myNextDH []byte
-		if to.ratchet == nil {
-			var nextDHPub [32]byte
-			curve25519.ScalarBaseMult(&nextDHPub, &to.currentDHPrivate)
-			myNextDH = nextDHPub[:]
-		}
-
-		var replyToId *uint64
 		if inReplyTo != nil {
-			replyToId = inReplyTo.message.Id
+			draft.inReplyTo = inReplyTo.message.GetId()
 		}
+		draft.body = click.textViews["body"]
 
-		body := click.textViews["body"]
-		// Zero length bodies are ACKs.
-		if len(body) == 0 {
-			body = " "
-		}
-
-		id := c.randId()
-		created := c.Now()
-		err := c.send(to, &pond.Message{
-			Id:               proto.Uint64(id),
-			Time:             proto.Int64(created.Unix()),
-			Body:             []byte(body),
-			BodyEncoding:     pond.Message_RAW.Enum(),
-			InReplyTo:        replyToId,
-			MyNextDh:         myNextDH,
-			Files:            draft.attachments,
-			DetachedFiles:    draft.detachments,
-			SupportedVersion: proto.Int32(protoVersion),
-		})
+		id, created, err := c.sendDraft(draft)
 		if err != nil {
 			// TODO: handle this case better.
 			println(err.Error())
 			c.log.Errorf("Error sending message: %s", err)
 			continue
 		}
+		to := c.contacts[draft.to]
 		c.outboxUI.Add(id, to.name, created.Format(shortTimeFormat), indicatorRed)
 		if inReplyTo != nil {
 			inReplyTo.acked = true
@@ -3113,18 +3363,26 @@ func (c *guiClient) composeUI(draft *Draft, inReplyTo *InboxMessage) interface{}
 // unsealPendingMessages is run once a key exchange with a contact has
 // completed and unseals any previously unreadable messages from that contact.
 func (c *guiClient) unsealPendingMessages(contact *Contact) {
+	var needToFilter = true
+
 	for _, msg := range c.inbox {
 		if msg.message == nil && msg.from == contact.id {
 			if !c.unsealMessage(msg, contact) || len(msg.message.Body) == 0 {
 				c.inboxUI.Remove(msg.id)
+				needToFilter = true
 				continue
 			}
 			subline := time.Unix(*msg.message.Time, 0).Format(shortTimeFormat)
 			c.inboxUI.SetSubline(msg.id, subline)
 			c.inboxUI.SetIndicator(msg.id, indicatorBlue)
-			c.updateWindowTitle()
 		}
 	}
+
+	if needToFilter {
+		c.dropSealedAndAckMessagesFrom(contact)
+	}
+
+	c.updateWindowTitle()
 }
 
 func (c *guiClient) processPANDAUpdateUI(update pandaUpdate) {
@@ -3161,6 +3419,10 @@ func (c *guiClient) addRevocationMessageUI(msg *queuedMessage) {
 
 func (c *guiClient) removeContactUI(contact *Contact) {
 	c.contactsUI.Remove(contact.id)
+}
+
+func (c *guiClient) logEventUI(contact *Contact, event Event) {
+	c.contactsUI.SetIndicator(contact.id, indicatorBlue)
 }
 
 func (c *guiClient) logUI() interface{} {
